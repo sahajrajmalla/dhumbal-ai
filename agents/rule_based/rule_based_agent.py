@@ -22,10 +22,10 @@ AI Agents (per Methodology Section 3.2.1):
 - Opportunistic: Adapts strategy based on coin balance (aggressive when ahead, conservative when behind)
 
 Implementation Details (per Methodology Section 3.7):
-- Python 3.9 with NumPy
+- Python 3.9 with NumPy and SciPy
 - Fixed random seed (42) for reproducibility
 - Comprehensive logging in JSON format per round
-- Statistical analysis with Cohen's d effect sizes, saved in CSV and JSON formats
+- Statistical analysis with Cohen's d, T-test p-values, and Bonferroni correction, saved in CSV and JSON formats
 - Modular design for research purposes
 """
 
@@ -39,6 +39,7 @@ from typing import List, Tuple, Optional, Dict, Any
 from dataclasses import dataclass
 from enum import Enum
 import numpy as np
+from scipy.stats import ttest_ind
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(message)s')
@@ -49,7 +50,7 @@ MAX_PLAYERS = 5
 MIN_PLAYERS = 2
 HAND_SIZE = 5
 JHYAP_THRESHOLD = 10
-STARTING_COINS = 1000000  # Updated to 1,000,000
+STARTING_COINS = 1000000
 MAX_TURNS = 100
 MIN_DISCARD_PILE_SIZE = 2
 MAX_PAYMENT = 100
@@ -176,6 +177,10 @@ class DhumbalGame:
             return False
         try:
             positions = sorted([self.RANK_ORDER[card.rank] for card in cards])
+            # Check if Ace is present and ensure it's at the start
+            if 'A' in [card.rank for card in cards]:
+                if positions[0] != 0:  # Ace must be at the lowest position
+                    return False
             return all(positions[i] == positions[i-1] + 1 for i in range(1, len(positions)))
         except KeyError:
             return False
@@ -485,6 +490,10 @@ def simulate_round(game: DhumbalGame, ai_players: List[RuleBasedAI], verbose: bo
                 other_ai.cards_seen.extend(cards_to_discard)
         if verbose:
             logger.info(f"Discarded: {[str(c) for c in cards_to_discard]}")
+        if not player_hand:
+            if verbose:
+                logger.info(f"Player {current_player} has no cards left, ending round")
+            return end_round(game, hands, current_player, game_state.turn_count, discard_pile, discards_per_player, verbose, debug)
         top_discard = discard_pile[-1] if discard_pile else None
         should_pick, specific_card = ai.should_pick_from_discard([top_discard] if top_discard else [], player_hand, game_state)
         if should_pick and top_discard:
@@ -492,13 +501,19 @@ def simulate_round(game: DhumbalGame, ai_players: List[RuleBasedAI], verbose: bo
             if verbose:
                 logger.info(f"Picked from discard: {top_discard}")
         else:
-            if not deck and len(discard_pile) >= MIN_DISCARD_PILE_SIZE:
+            if not deck and len(discard_pile) > 1:  # Ensure at least one card remains in discard pile
                 top = discard_pile.pop() if discard_pile else None
                 random.shuffle(discard_pile)
                 deck.extend(discard_pile[:])
                 discard_pile[:] = [top] if top else []
                 if debug:
                     logger.debug(f"Reshuffled discard pile into deck, new deck size: {len(deck)}")
+            elif not deck and len(discard_pile) <= 1:
+                if verbose:
+                    logger.info("Insufficient cards in discard pile to reshuffle, ending round")
+                hand_values = [game.calculate_hand_value(hand) for hand in hands]
+                caller = hand_values.index(min(hand_values))
+                return end_round(game, hands, caller, game_state.turn_count, discard_pile, discards_per_player, verbose, debug)
             if deck:
                 picked_card = deck.pop()
                 player_hand.append(picked_card)
@@ -522,11 +537,11 @@ def end_round(game: DhumbalGame, hands: List[List[Card]], caller: int, turns_pla
     caller_value = hand_values[caller]
     min_value = min(hand_values)
     min_value_players = [i for i, v in enumerate(hand_values) if v == min_value]
-    if len(min_value_players) == 1 and min_value_players[0] == caller:
-        winner = caller
+    non_caller_min = [i for i in min_value_players if i != caller]
+    if non_caller_min:
+        winner = non_caller_min[0]  # Select first non-caller with minimum value
     else:
-        non_caller_min = [i for i in min_value_players if i != caller]
-        winner = min(non_caller_min) if non_caller_min else min_value_players[0]
+        winner = caller  # Only caller has minimum value
     successful_call = (caller == winner)
     coin_changes = [0] * game.num_players
     if successful_call:
@@ -576,11 +591,11 @@ def end_round(game: DhumbalGame, hands: List[List[Card]], caller: int, turns_pla
 def calculate_cohens_d(group1: List[float], group2: List[float]) -> float:
     if len(group1) < 2 or len(group2) < 2:
         return 0.0
-    pooled_std = np.sqrt(((len(group1)-1)*np.var(group1) + (len(group2)-1)*np.var(group2)) / 
+    pooled_std = np.sqrt(((len(group1)-1)*np.var(group1) + (len(group2)-1)*np.var(group2)) /
                         (len(group1)+len(group2)-2))
     return (np.mean(group1) - np.mean(group2)) / pooled_std if pooled_std != 0 else 0.0
 
-def simulate_full_game(num_players: int = 4, max_rounds: int = 10000, verbose: bool = True, debug: bool = False) -> Dict[str, Any]:
+def simulate_full_game(num_players: int = 4, max_rounds: int = 2000, verbose: bool = True, debug: bool = False) -> Dict[str, Any]:
     random.seed(42)
     np.random.seed(42)
     game = DhumbalGame(num_players)
@@ -666,20 +681,28 @@ def analyze_game_results(game: DhumbalGame, ai_players: List[RuleBasedAI], round
     for i in range(game.num_players):
         calls = jhyap_calls[i]
         successes = risk_data[i]
-        if len(calls) >= 2:
+        if len(calls) >= 2 and len(calls) == len(successes):
             risk_assessment.append(np.corrcoef(calls, successes)[0,1])
         else:
-            risk_assessment.append(0.0)
-    # Cohen's d pairwise
+            risk_assessment.append(None)  # Indicate insufficient data
+    # Cohen's d and T-test p-values with Bonferroni correction
     cohens_d = {}
+    p_values = {}
     metrics = ['win', 'economic', 'jhyap', 'cards', 'risk']
-    data_lists = [win_data, economic_data, jhyap_data, cards_data, [risk_data[i] if len(risk_data[i]) >= 2 else [0]*total_rounds for i in range(game.num_players)]]
+    data_lists = [win_data, economic_data, jhyap_data, cards_data, [[r if r is not None else 0 for r in risk_data[i]] if risk_assessment[i] is not None else [0]*total_rounds for i in range(game.num_players)]]
+    comparisons = [(i, j) for i in range(game.num_players) for j in range(i+1, game.num_players)]
+    adjusted_alpha = 0.05 / len(comparisons) if comparisons else 0.05
     for m, metric in enumerate(metrics):
         cohens_d[metric] = {}
-        for i in range(game.num_players):
-            for j in range(i+1, game.num_players):
-                d = calculate_cohens_d(data_lists[m][i], data_lists[m][j])
-                cohens_d[metric][f'P{i} vs P{j}'] = d
+        p_values[metric] = {}
+        for i, j in comparisons:
+            comp_key = f'P{i} vs P{j}'
+            cohens_d[metric][comp_key] = calculate_cohens_d(data_lists[m][i], data_lists[m][j])
+            if len(data_lists[m][i]) >= 2 and len(data_lists[m][j]) >= 2:
+                _, p_val = ttest_ind(data_lists[m][i], data_lists[m][j], equal_var=False)
+                p_values[metric][comp_key] = p_val
+            else:
+                p_values[metric][comp_key] = None
     results = {
         'game_summary': {
             'total_rounds': total_rounds,
@@ -702,7 +725,11 @@ def analyze_game_results(game: DhumbalGame, ai_players: List[RuleBasedAI], round
             'successful_calls': len(successful_calls),
             'total_coins_transferred': int(total_coins_transferred)
         },
-        'cohens_d': cohens_d,
+        'statistical_analysis': {
+            'cohens_d': cohens_d,
+            'p_values': p_values,
+            'adjusted_alpha': adjusted_alpha
+        },
         'round_details': [r.to_dict() for r in round_results]
     }
     # Save to CSV
@@ -710,13 +737,19 @@ def analyze_game_results(game: DhumbalGame, ai_players: List[RuleBasedAI], round
         writer = csv.writer(f)
         writer.writerow(['Player', 'Win Rate', 'Win CI', 'Economic Performance', 'Jhyap Success Rate', 'Cards Discarded', 'Risk Assessment'])
         for i in range(game.num_players):
-            writer.writerow([ai_players[i].name, win_rates[i], win_ci[i], economic_performance[i], jhyap_success_rates[i], cards_discarded[i], risk_assessment[i]])
-    with open('cohens_d.csv', 'w', newline='') as f:
+            risk_val = risk_assessment[i] if risk_assessment[i] is not None else 'N/A'
+            writer.writerow([ai_players[i].name, win_rates[i], win_ci[i], economic_performance[i], jhyap_success_rates[i], cards_discarded[i], risk_val])
+    with open('statistical_analysis.csv', 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['Comparison', 'Win d', 'Economic d', 'Jhyap d', 'Cards d', 'Risk d'])
-        comparisons = list(cohens_d['win'].keys())
+        writer.writerow(['Comparison', 'Win d', 'Win p-value', 'Economic d', 'Economic p-value', 'Jhyap d', 'Jhyap p-value', 'Cards d', 'Cards p-value', 'Risk d', 'Risk p-value'])
         for comp in comparisons:
-            writer.writerow([comp, cohens_d['win'][comp], cohens_d['economic'][comp], cohens_d['jhyap'][comp], cohens_d['cards'][comp], cohens_d['risk'][comp]])
+            comp_key = f'P{comp[0]} vs P{comp[1]}'
+            row = [comp_key]
+            for metric in metrics:
+                d = cohens_d[metric][comp_key]
+                p = p_values[metric][comp_key] if p_values[metric][comp_key] is not None else 'N/A'
+                row.extend([d, p])
+            writer.writerow(row)
     # Save full results to JSON
     with open('full_results.json', 'w') as f:
         json.dump(results, f, indent=4)
@@ -740,23 +773,28 @@ def analyze_game_results(game: DhumbalGame, ai_players: List[RuleBasedAI], round
             logger.info(f"    Economic performance: {economic_performance[i]:.1f} coins/game")
             logger.info(f"    Jhyap success rate: {jhyap_success_rates[i]:.1f}%")
             logger.info(f"    Strategic depth: {cards_discarded[i]:.1f} cards/turn")
-            logger.info(f"    Risk assessment (corr): {risk_assessment[i]:.2f}")
+            risk_val = risk_assessment[i] if risk_assessment[i] is not None else 'N/A'
+            logger.info(f"    Risk assessment (corr): {risk_val}")
         logger.info("\nGAME STATISTICS:")
         logger.info(f"  Average winning hand value: {avg_winning_hand:.1f} points")
         logger.info(f"  Average round length: {avg_turns_per_round:.1f} turns")
         logger.info(f"  Successful Jhyap calls: {len(successful_calls)}/{total_rounds}")
-        logger.info("\nCohen's d Effect Sizes (saved to cohens_d.csv):")
-        for metric, ds in cohens_d.items():
+        logger.info(f"\nSTATISTICAL ANALYSIS (Bonferroni adjusted α = {adjusted_alpha:.4f}):")
+        for metric in metrics:
             logger.info(f"  {metric.capitalize()}:")
-            for comp, d in ds.items():
-                logger.info(f"    {comp}: {d:.2f}")
-        logger.info("\nResults saved to metrics.csv, cohens_d.csv, and full_results.json")
+            for comp in comparisons:
+                comp_key = f'P{comp[0]} vs P{comp[1]}'
+                d = cohens_d[metric][comp_key]
+                p = p_values[metric][comp_key] if p_values[metric][comp_key] is not None else 'N/A'
+                significance = " (significant)" if p != 'N/A' and p < adjusted_alpha else ""
+                logger.info(f"    {comp_key}: Cohen's d = {d:.2f}, p-value = {p if p != 'N/A' else p}{significance}")
+        logger.info("\nResults saved to metrics.csv, statistical_analysis.csv, and full_results.json")
     return results
 
 if __name__ == "__main__":
     random.seed(42)
     np.random.seed(42)
-    results = simulate_full_game(num_players=4, max_rounds=10000, verbose=True, debug=False)
+    results = simulate_full_game(num_players=4, max_rounds=2000, verbose=True, debug=False)
     logger.info("\n✅ RULE-BASED TOURNAMENT COMPLETE!")
     logger.info(f"Winner: {results['game_summary']['winner_name']}")
     logger.info(f"Total rounds: {results['game_summary']['total_rounds']}")
