@@ -4,12 +4,13 @@ import random
 import csv
 import os
 import json
-from collections import deque
-from typing import List, Tuple, Optional
+from collections import deque, defaultdict
+from typing import List, Tuple, Optional, Any
 from dataclasses import dataclass
 from enum import Enum
 from tensorflow.keras import models, layers, optimizers
 from datetime import datetime
+import itertools
 
 # Configure TensorFlow for GPU if available
 physical_devices = tf.config.list_physical_devices('GPU')
@@ -27,11 +28,11 @@ MAX_PLAYERS = 5
 MIN_PLAYERS = 2
 HAND_SIZE = 5
 JHYAP_THRESHOLD = 10
-STARTING_COINS = 10000
+STARTING_COINS = 1000000
 MAX_TURNS = 50
 MIN_DISCARD_PILE_SIZE = 2
 MAX_PAYMENT = 100
-TRAINING_EPISODES = 10000
+TRAINING_EPISODES = 50000
 BATCH_SIZE = 32
 LEARNING_RATE = 1e-4
 GAMMA = 0.99
@@ -40,7 +41,7 @@ EPSILON_START = 1.0
 EPSILON_END = 0.01
 EPSILON_DECAY = 0.995
 TARGET_UPDATE_FREQ = 100
-CONVERGENCE_THRESHOLD = 0.02
+CONVERGENCE_THRESHOLD = 0.05  # Reverted to original value
 CONVERGENCE_EPISODES = 500
 
 class AIStyle(Enum):
@@ -56,7 +57,7 @@ class GameState:
     current_player: int
     hands: List[List['Card']]
     discard_pile: List['Card']
-    deck_size: int
+    deck: List['Card']
     player_coins: List[int]
     turn_count: int
     phase: str
@@ -69,7 +70,7 @@ class GameState:
             current_player=self.current_player,
             hands=[hand[:] for hand in self.hands],
             discard_pile=self.discard_pile[:],
-            deck_size=self.deck_size,
+            deck=self.deck[:],
             player_coins=self.player_coins.copy(),
             turn_count=self.turn_count,
             phase=self.phase,
@@ -83,7 +84,7 @@ class GameState:
             'current_player': self.current_player,
             'hands': [[str(card) for card in hand] for hand in self.hands],
             'discard_pile': [str(card) for card in self.discard_pile],
-            'deck_size': self.deck_size,
+            'deck': [str(card) for card in self.deck],
             'player_coins': self.player_coins,
             'turn_count': self.turn_count,
             'phase': self.phase,
@@ -154,8 +155,30 @@ class DhumbalGame:
     def can_call_jhyap(self, hand: List[Card]) -> bool:
         return self.calculate_hand_value(hand) <= JHYAP_THRESHOLD
 
+    def validate_same_rank_set(self, cards: List[Card]) -> bool:
+        if len(cards) < 2:
+            return False
+        return all(card.rank == cards[0].rank for card in cards)
+
+    def validate_sequence(self, cards: List[Card]) -> bool:
+        if len(cards) < 3:
+            return False
+        if not all(card.suit == cards[0].suit for card in cards):
+            return False
+        try:
+            positions = sorted([self.RANK_ORDER[card.rank] for card in cards])
+            if 'A' in [card.rank for card in cards] and positions[0] != 0:
+                return False
+            return all(positions[i] == positions[i-1] + 1 for i in range(1, len(positions)))
+        except KeyError:
+            return False
+
     def validate_discard(self, cards: List[Card]) -> bool:
-        return len(cards) == 1
+        if not cards:
+            return False
+        if len(cards) == 1:
+            return True
+        return self.validate_same_rank_set(cards) or self.validate_sequence(cards)
 
     def get_active_players(self) -> List[int]:
         return [i for i, coins in enumerate(self.player_coins) if coins > 0]
@@ -171,35 +194,73 @@ class RuleBasedAI:
 
     def choose_discard(self, hand: List[Card], game_state: GameState, game: DhumbalGame) -> List[Card]:
         if not hand: return []
+        valid_discards = []
+        for card in hand:
+            valid_discards.append([card])
+        rank_groups = defaultdict(list)
+        for card in hand:
+            rank_groups[card.rank].append(card)
+        for cards in rank_groups.values():
+            if len(cards) >= 2:
+                for size in range(2, len(cards) + 1):
+                    valid_discards.extend(list(combo) for combo in itertools.combinations(cards, size))
+        suit_groups = defaultdict(list)
+        for card in hand:
+            suit_groups[card.suit].append(card)
+        for suit, cards in suit_groups.items():
+            if len(cards) >= 3:
+                cards.sort(key=lambda x: game.RANK_ORDER[x.rank])
+                for size in range(3, len(cards) + 1):
+                    for combo in itertools.combinations(cards, size):
+                        if game.validate_sequence(list(combo)):
+                            valid_discards.append(list(combo))
+        if not valid_discards:
+            return []
         hand_value = sum(card.value for card in hand)
         if self.style == AIStyle.CONSERVATIVE:
-            return [min(hand, key=lambda x: x.value)] if hand_value <= JHYAP_THRESHOLD else [max(hand, key=lambda x: x.value)]
+            if hand_value <= JHYAP_THRESHOLD + 5:
+                return min(valid_discards, key=lambda x: sum(c.value for c in x))
+            else:
+                return max(valid_discards, key=lambda x: sum(c.value for c in x))
         elif self.style == AIStyle.AGGRESSIVE:
-            return [min(hand, key=lambda x: x.value)]
+            multi_discards = [d for d in valid_discards if len(d) > 1]
+            if multi_discards:
+                return max(multi_discards, key=lambda x: sum(c.value for c in x))
+            else:
+                return max(valid_discards, key=lambda x: sum(c.value for c in x))
         elif self.style == AIStyle.OPPORTUNISTIC:
-            return [min(hand, key=lambda x: x.value)] if hand_value <= JHYAP_THRESHOLD else [random.choice(hand)]
+            my_coins = game_state.player_coins[self.player_id]
+            avg_coins = sum(game_state.player_coins) / len(game_state.player_coins)
+            if my_coins < avg_coins:
+                return max(valid_discards, key=lambda x: sum(c.value for c in x))
+            else:
+                return random.choice(valid_discards)
         elif self.style == AIStyle.BALANCED:
-            mid_cards = [c for c in hand if 4 <= c.value <= 8]
-            return [random.choice(mid_cards)] if mid_cards else [max(hand, key=lambda x: x.value)]
-        return [random.choice(hand)]
+            multi_discards = [d for d in valid_discards if len(d) > 1]
+            if multi_discards:
+                return max(multi_discards, key=lambda x: len(x))
+            else:
+                return random.choice(valid_discards)
+        return random.choice(valid_discards)
 
-    def should_pick_from_discard(self, available_cards: List[Card], current_hand: List[Card], game_state: GameState, game: DhumbalGame) -> Tuple[bool, Optional[Card]]:
-        if not available_cards or len(current_hand) >= HAND_SIZE: return False, None
+    def should_pick_from_discard(self, discard_pile: List[Card], current_hand: List[Card], game_state: GameState, game: DhumbalGame) -> Tuple[bool, Optional[Card]]:
+        if not discard_pile or len(current_hand) >= HAND_SIZE: return False, None
+        top_card = discard_pile[-1]
         current_value = sum(card.value for card in current_hand)
         if self.style == AIStyle.CONSERVATIVE:
-            pickup_threshold = 3 if current_value <= 12 else 5
-            good_cards = [card for card in available_cards if card.value <= pickup_threshold]
-            return (True, min(good_cards, key=lambda x: x.value)) if good_cards else (False, None)
+            return (True, top_card) if top_card.value <= 3 or (top_card.value <= 5 and current_value > JHYAP_THRESHOLD) else (False, None)
         elif self.style == AIStyle.AGGRESSIVE:
-            good_cards = [card for card in available_cards if card.value <= 5]
-            return (True, min(good_cards, key=lambda x: x.value)) if good_cards else (False, None)
+            return (True, top_card) if top_card.value <= 5 else (False, None)
         elif self.style == AIStyle.OPPORTUNISTIC:
-            top_card = available_cards[-1]
-            return (True, top_card) if top_card.value <= 5 and current_value > JHYAP_THRESHOLD else (False, None)
+            my_coins = game_state.player_coins[self.player_id]
+            avg_coins = sum(game_state.player_coins) / len(game_state.player_coins)
+            return (True, top_card) if (top_card.value <= 4 and my_coins < avg_coins) or top_card.value <= 2 else (False, None)
         elif self.style == AIStyle.BALANCED:
-            good_cards = [card for card in available_cards if card.value <= 4]
-            return (True, min(good_cards, key=lambda x: x.value)) if good_cards else (False, None)
-        return (True, random.choice(available_cards)) if random.random() < 0.5 else (False, None)
+            for card in current_hand:
+                if card.rank == top_card.rank or (card.suit == top_card.suit and abs(game.RANK_ORDER[card.rank] - game.RANK_ORDER[top_card.rank]) == 1):
+                    return True, top_card
+            return (True, top_card) if top_card.value <= 4 else (False, None)
+        return (True, top_card) if random.random() < 0.5 else (False, None)
 
     def should_call_jhyap(self, hand: List[Card], game_state: GameState, game: DhumbalGame) -> bool:
         hand_value = sum(card.value for card in hand)
@@ -207,12 +268,13 @@ class RuleBasedAI:
         if self.style == AIStyle.CONSERVATIVE:
             return hand_value <= 7
         elif self.style == AIStyle.AGGRESSIVE:
-            return True
+            return hand_value <= 10
         elif self.style == AIStyle.OPPORTUNISTIC:
-            low_discard = any(card.value <= 5 for card in game_state.discard_pile[-3:]) if game_state.discard_pile else False
-            return hand_value <= 8 and low_discard
+            my_coins = game_state.player_coins[self.player_id]
+            avg_coins = sum(game_state.player_coins) / len(game_state.player_coins)
+            return hand_value <= 9 if my_coins < avg_coins else hand_value <= 8
         elif self.style == AIStyle.BALANCED:
-            return hand_value <= 8
+            return hand_value <= 8 or (hand_value <= 10 and game_state.turn_count > 10)
         return random.random() < 0.5
 
 class DhumbalEnv:
@@ -227,7 +289,7 @@ class DhumbalEnv:
             current_player=current_player,
             hands=[hand[:] for hand in self.hands],
             discard_pile=self.discard_pile[:],
-            deck_size=len(self.deck),
+            deck=self.deck[:],
             player_coins=game.player_coins.copy(),
             turn_count=0,
             phase='call'
@@ -237,53 +299,80 @@ class DhumbalEnv:
         self.hands, self.deck = self.game.deal_cards()
         self.discard_pile = [self.deck.pop()] if self.deck else []
         self.state = GameState(
-            round_number=self.game.round_number + 1,
+            round_number=game.round_number + 1,
             current_player=self.current_player,
             hands=[hand[:] for hand in self.hands],
             discard_pile=self.discard_pile[:],
-            deck_size=len(self.deck),
+            deck=self.deck[:],
             player_coins=game.player_coins.copy(),
             turn_count=0,
             phase='call'
         )
-        print(f"Reset environment: Round {self.state.round_number}, Player {self.state.current_player}, Deck size {self.state.deck_size}, Initial hands {[self.game.calculate_hand_value(hand) for hand in self.hands]}")
         return self.encode_state()
 
     def set_state(self, new_state: GameState):
         self.state = new_state.copy()
         self.hands = [hand[:] for hand in new_state.hands]
         self.discard_pile = new_state.discard_pile[:]
-        current_deck_size = len(self.deck)
-        target_deck_size = new_state.deck_size
-        if current_deck_size < target_deck_size:
-            self.deck.extend([Card(random.choice(self.game.SUITS), random.choice(self.game.RANKS))
-                             for _ in range(target_deck_size - current_deck_size)])
-        elif current_deck_size > target_deck_size:
-            self.deck = self.deck[:target_deck_size]
+        self.deck = new_state.deck[:]
 
     def encode_state(self) -> np.ndarray:
         hand = self.state.hands[self.state.current_player]
         hand_encoding = np.zeros(52)
         for card in hand:
             suit_idx = self.game.SUITS.index(card.suit)
-            rank_idx = self.game.RANKS.index(card.rank)
+            rank_idx = self.game.RANK_ORDER[card.rank]
             card_idx = suit_idx * 13 + rank_idx
             hand_encoding[card_idx] = 1
         discard_encoding = np.zeros(52)
         if self.state.discard_pile:
             top_card = self.state.discard_pile[-1]
             suit_idx = self.game.SUITS.index(top_card.suit)
-            rank_idx = self.game.RANKS.index(top_card.rank)
+            rank_idx = self.game.RANK_ORDER[top_card.rank]
             discard_encoding[suit_idx * 13 + rank_idx] = 1
-        return np.concatenate([hand_encoding, discard_encoding])
+        player_one_hot = np.zeros(self.game.num_players)
+        player_one_hot[self.state.current_player] = 1
+        hand_value = self.game.calculate_hand_value(hand) / (13 * HAND_SIZE)
+        turn_norm = self.state.turn_count / MAX_TURNS
+        opp_hand_sizes = [len(h) / HAND_SIZE for i, h in enumerate(self.state.hands) if i != self.state.current_player]
+        avg_opp_hand_size = np.mean(opp_hand_sizes) if opp_hand_sizes else 0
+        my_coins_norm = self.state.player_coins[self.state.current_player] / STARTING_COINS
+        avg_opp_coins = np.mean([c / STARTING_COINS for i, c in enumerate(self.state.player_coins) if i != self.state.current_player])
+        phase_one_hot = np.zeros(3)
+        phase_map = {'call': 0, 'discard': 1, 'pick': 2}
+        phase_one_hot[phase_map[self.state.phase]] = 1
+        state = np.concatenate([hand_encoding, discard_encoding, player_one_hot, [hand_value, turn_norm, avg_opp_hand_size, my_coins_norm, avg_opp_coins], phase_one_hot])
+        assert state.shape[0] == 117, f"State size mismatch: expected 117, got {state.shape[0]}"
+        return state
 
-    def get_actions(self) -> List:
+    def get_actions(self) -> List[Any]:
         actions = []
         if self.state.phase == 'call':
-            actions = [True, False] if self.game.can_call_jhyap(self.state.hands[self.state.current_player]) else [False]
+            actions = [False, True] if self.game.can_call_jhyap(self.state.hands[self.state.current_player]) else [False]
         elif self.state.phase == 'discard':
             hand = self.state.hands[self.state.current_player]
-            actions = [[card] for card in hand] if hand else [[]]
+            if not hand:
+                return []
+            for card in hand:
+                actions.append([card])
+            rank_groups = defaultdict(list)
+            for card in hand:
+                rank_groups[card.rank].append(card)
+            for cards in rank_groups.values():
+                if len(cards) >= 2:
+                    for size in range(2, len(cards) + 1):
+                        actions.extend(list(combo) for combo in itertools.combinations(cards, size))
+            suit_groups = defaultdict(list)
+            for card in hand:
+                suit_groups[card.suit].append(card)
+            for suit, cards in suit_groups.items():
+                if len(cards) >= 3:
+                    cards.sort(key=lambda x: self.game.RANK_ORDER[x.rank])
+                    for size in range(3, len(cards) + 1):
+                        for combo in itertools.combinations(cards, size):
+                            combo_list = list(combo)
+                            if self.game.validate_sequence(combo_list):
+                                actions.append(combo_list)
         elif self.state.phase == 'pick':
             if len(self.state.hands[self.state.current_player]) < HAND_SIZE:
                 actions = ['deck']
@@ -291,24 +380,24 @@ class DhumbalEnv:
                     actions.append('discard')
         return actions
 
-    def action_to_index(self, action) -> int:
+    def action_to_index(self, action: Any) -> int:
         actions = self.get_actions()
         if not actions:
             return 0
-        if self.state.phase == 'call':
-            return 0 if action is False else 1
-        elif self.state.phase == 'discard':
-            hand = self.state.hands[self.state.current_player]
-            all_combinations = [[card] for card in hand] if hand else [[]]
-            all_combinations.sort(key=lambda x: tuple(str(c) for c in x) if x else ())
-            for idx, combo in enumerate(all_combinations):
-                if combo == action:
-                    return idx
-            return 0
-        else:
-            return 0 if action == 'deck' else 1
+        def action_key(act):
+            if isinstance(act, bool):
+                return str(act)
+            elif isinstance(act, str):
+                return act
+            else:
+                return tuple(sorted(str(c) for c in act))
+        sorted_actions = sorted(actions, key=action_key)
+        for idx, act in enumerate(sorted_actions):
+            if action_key(act) == action_key(action):
+                return idx
+        return 0
 
-    def index_to_action(self, index: int):
+    def index_to_action(self, index: int) -> Any:
         actions = self.get_actions()
         if not actions:
             if self.state.phase == 'call':
@@ -317,113 +406,129 @@ class DhumbalEnv:
                 return [self.state.hands[self.state.current_player][0]] if self.state.hands[self.state.current_player] else []
             else:
                 return 'deck'
-        return actions[index % len(actions)]
+        def action_key(act):
+            if isinstance(act, bool):
+                return str(act)
+            elif isinstance(act, str):
+                return act
+            else:
+                return tuple(sorted(str(c) for c in act))
+        sorted_actions = sorted(actions, key=action_key)
+        return sorted_actions[index % len(sorted_actions)]
 
     def get_action_space_size(self) -> int:
-        return max(1, len(self.get_actions()))
+        return 128
 
-    def step(self, action) -> Tuple[np.ndarray, float, bool]:
+    def step(self, action: Any) -> Tuple[np.ndarray, float, bool, dict]:
         new_state = self.state.copy()
         reward = 0.0
         done = False
         player = new_state.current_player
         hand_size = len(new_state.hands[player])
-        hand_value = self.game.calculate_hand_value(new_state.hands[player])
-        print(f"Turn {new_state.turn_count+1}, Player {player}, Phase {new_state.phase}, Hand size {hand_size}, Hand value {hand_value}, Action {action}")
+        old_hand_value = self.game.calculate_hand_value(new_state.hands[player])
         log_entry = {
             'turn': new_state.turn_count + 1,
             'player': player,
             'phase': new_state.phase,
             'hand_size': hand_size,
-            'hand_value': hand_value,
+            'old_hand_value': old_hand_value,
             'action': str(action) if isinstance(action, list) else action,
             'state_before': new_state.to_dict()
         }
 
         if new_state.phase == 'call':
-            if action and self.game.can_call_jhyap(new_state.hands[player]):
-                hand_values = [self.game.calculate_hand_value(hand) for hand in new_state.hands]
-                caller = player
-                caller_value = hand_values[caller]
-                min_value = min(hand_values)
-                min_value_players = [i for i, v in enumerate(hand_values) if v == min_value]
-                if len(min_value_players) == 1 and min_value_players[0] == caller:
-                    new_state.winner = caller
-                    reward = sum(min(v, MAX_PAYMENT) for i, v in enumerate(hand_values) if i != caller)
-                else:
+            if isinstance(action, bool):
+                if action and self.game.can_call_jhyap(new_state.hands[player]):
+                    hand_values = [self.game.calculate_hand_value(hand) for hand in new_state.hands]
+                    caller = player
+                    min_value = min(hand_values)
+                    min_value_players = [i for i, v in enumerate(hand_values) if v == min_value]
                     non_caller_min = [i for i in min_value_players if i != caller]
-                    new_state.winner = min(non_caller_min) if non_caller_min else min_value_players[0]
-                    reward = -sum(min(v, MAX_PAYMENT) for v in hand_values)
-                new_state.done = True
-                print(f"Episode ended: Jhyap call, Hand values {hand_values}, Winner {new_state.winner}, Reward {reward}")
-            elif action and not self.game.can_call_jhyap(new_state.hands[player]):
-                reward = -100.0
-                new_state.done = True
-                new_state.winner = (player + 1) % self.game.num_players
-                print(f"Episode ended: Invalid Jhyap call, Winner {new_state.winner}, Reward {reward}")
-            else:
-                new_state.phase = 'discard'
-                print(f"Player {player} chose not to call Jhyap, moving to discard phase")
+                    if non_caller_min:
+                        winner = non_caller_min[0]
+                    else:
+                        winner = caller
+                    successful_call = (caller == winner)
+                    if successful_call:
+                        reward = sum(min(v, MAX_PAYMENT) for i, v in enumerate(hand_values) if i != caller)
+                    else:
+                        total_payment = sum(min(v, MAX_PAYMENT) for v in hand_values)
+                        reward = -total_payment
+                    new_state.done = True
+                    new_state.winner = winner
+                elif action:
+                    reward = -100.0
+                    new_state.done = True
+                    new_state.winner = (player + 1) % self.game.num_players
+                else:
+                    new_state.phase = 'discard'
+                    reward = 0.0
 
         elif new_state.phase == 'discard':
             if self.game.validate_discard(action) and all(card in new_state.hands[player] for card in action):
+                discard_value = sum(c.value for c in action)
                 for card in action:
                     new_state.hands[player].remove(card)
                 new_state.discard_pile.extend(action)
                 new_state.phase = 'pick'
-                print(f"Player {player} discarded {action}, moving to pick phase")
+                new_hand_value = self.game.calculate_hand_value(new_state.hands[player])
+                reward = (old_hand_value - new_hand_value) / 13.0
             else:
                 reward = -100.0
                 new_state.done = True
                 new_state.winner = (player + 1) % self.game.num_players
-                print(f"Episode ended: Invalid discard, Winner {new_state.winner}, Reward {reward}")
 
         elif new_state.phase == 'pick':
             if len(new_state.hands[player]) >= HAND_SIZE:
                 reward = -100.0
                 new_state.done = True
                 new_state.winner = (player + 1) % self.game.num_players
-                print(f"Episode ended: Hand size limit exceeded, Winner {new_state.winner}, Reward {reward}")
             elif action == 'discard' and new_state.discard_pile:
                 card = new_state.discard_pile.pop()
                 new_state.hands[player].append(card)
-                new_state.deck_size = len(self.deck)
-                print(f"Player {player} picked {card} from discard pile, new hand value {self.game.calculate_hand_value(new_state.hands[player])}")
+                new_hand_value = self.game.calculate_hand_value(new_state.hands[player])
+                reward = (old_hand_value - new_hand_value) / 13.0 if new_hand_value < old_hand_value else -0.1
             elif action == 'deck':
-                if not self.deck and len(new_state.discard_pile) >= MIN_DISCARD_PILE_SIZE:
+                if not new_state.deck and len(new_state.discard_pile) >= MIN_DISCARD_PILE_SIZE:
                     top = new_state.discard_pile.pop() if new_state.discard_pile else None
                     random.shuffle(new_state.discard_pile)
-                    self.deck.extend(new_state.discard_pile[:])
+                    new_state.deck.extend(new_state.discard_pile[:])
                     new_state.discard_pile = [top] if top else []
-                    new_state.deck_size = len(self.deck)
-                    print(f"Shuffled discard pile into deck, new deck size {new_state.deck_size}")
-                if self.deck:
-                    card = self.deck.pop()
+                if new_state.deck:
+                    card = new_state.deck.pop()
                     new_state.hands[player].append(card)
-                    new_state.deck_size = len(self.deck)
-                    print(f"Player {player} picked {card} from deck, new hand value {self.game.calculate_hand_value(new_state.hands[player])}")
+                    new_hand_value = self.game.calculate_hand_value(new_state.hands[player])
+                    reward = (old_hand_value - new_hand_value) / 13.0 if new_hand_value < old_hand_value else -0.1
                 else:
                     new_state.done = True
                     hand_values = [self.game.calculate_hand_value(hand) for hand in new_state.hands]
-                    new_state.winner = hand_values.index(min(hand_values))
-                    reward = -sum(min(v, MAX_PAYMENT) for v in hand_values) if new_state.winner != player else sum(min(v, MAX_PAYMENT) for i, v in enumerate(hand_values) if i != player)
-                    print(f"Episode ended: Deck exhausted, Hand values {hand_values}, Winner {new_state.winner}, Reward {reward}")
+                    min_value = min(hand_values)
+                    min_value_players = [i for i, v in enumerate(hand_values) if v == min_value]
+                    non_caller_min = [i for i in min_value_players if i != player]
+                    new_state.winner = non_caller_min[0] if non_caller_min else player
+                    if new_state.winner == player:
+                        reward = sum(min(v, MAX_PAYMENT) for i, v in enumerate(hand_values) if i != player)
+                    else:
+                        reward = -hand_values[player]
             else:
                 reward = -100.0
                 new_state.done = True
                 new_state.winner = (player + 1) % self.game.num_players
-                print(f"Episode ended: Invalid pick, Winner {new_state.winner}, Reward {reward}")
             if not new_state.done:
                 new_state.turn_count += 1
                 new_state.current_player = (new_state.current_player + 1) % self.game.num_players
                 new_state.phase = 'call'
-                print(f"Advancing to next turn: Turn {new_state.turn_count+1}, Next player {new_state.current_player}")
                 if new_state.turn_count >= MAX_TURNS:
                     new_state.done = True
                     hand_values = [self.game.calculate_hand_value(hand) for hand in new_state.hands]
-                    new_state.winner = hand_values.index(min(hand_values))
-                    reward = -sum(min(v, MAX_PAYMENT) for v in hand_values) if new_state.winner != player else sum(min(v, MAX_PAYMENT) for i, v in enumerate(hand_values) if i != player)
-                    print(f"Episode ended: Max turns reached, Hand values {hand_values}, Winner {new_state.winner}, Reward {reward}")
+                    min_value = min(hand_values)
+                    min_value_players = [i for i, v in enumerate(hand_values) if v == min_value]
+                    non_caller_min = [i for i in min_value_players if i != player]
+                    new_state.winner = non_caller_min[0] if non_caller_min else player
+                    if new_state.winner == player:
+                        reward += sum(min(v, MAX_PAYMENT) for i, v in enumerate(hand_values) if i != player)
+                    else:
+                        reward += -hand_values[player]
 
         self.set_state(new_state)
         log_entry['reward'] = reward
@@ -447,7 +552,8 @@ class DQN:
 
     def build_model(self):
         model = models.Sequential([
-            layers.Dense(128, input_shape=(self.state_size,), activation='relu'),
+            layers.Input(shape=(self.state_size,)),
+            layers.Dense(128, activation='relu'),
             layers.Dense(64, activation='relu'),
             layers.Dense(self.max_action_size, activation='linear')
         ])
@@ -455,29 +561,24 @@ class DQN:
 
     def update_target_model(self):
         self.target_model.set_weights(self.model.get_weights())
-        print("Updated target model weights")
 
     def act(self, state: np.ndarray, env: DhumbalEnv) -> int:
-        action_space_size = env.get_action_space_size()
+        action_space_size = len(env.get_actions())
         state = np.array(state, dtype=np.float32).reshape(1, -1)
         if np.random.rand() <= self.epsilon:
-            action = np.random.choice(action_space_size)
-            print(f"Exploration: Selected random action {action} (epsilon: {self.epsilon:.3f})")
-            return action
+            return random.randrange(action_space_size)
         with tf.device('/GPU:0'):
             q_values = self.model(state, training=False)[0].numpy()
         q_values = q_values[:action_space_size]
-        action = np.argmax(q_values)
-        print(f"Exploitation: Selected action {action} with Q-values {q_values[:action_space_size]}")
-        return action
+        valid_mask = np.ones(action_space_size)
+        q_values_masked = q_values * valid_mask + (1 - valid_mask) * -np.inf
+        return np.argmax(q_values_masked)
 
     def remember(self, state, action, reward, next_state, done):
         self.memory.append((state, action, reward, next_state, done))
-        print(f"Stored transition: Action {action}, Reward {reward}, Done {done}")
 
     def replay(self, batch_size: int):
         if len(self.memory) < batch_size:
-            print(f"Memory size {len(self.memory)} is less than batch size {batch_size}, skipping replay")
             return
         minibatch = random.sample(self.memory, batch_size)
         states = np.array([m[0] for m in minibatch], dtype=np.float32)
@@ -487,27 +588,17 @@ class DQN:
         dones = np.array([m[4] for m in minibatch])
 
         with tf.device('/GPU:0'):
-            targets = self.model(states, training=False).numpy()
-            target_next = self.target_model(next_states, training=False).numpy()
-            for i in range(batch_size):
-                if dones[i]:
-                    targets[i][actions[i]] = rewards[i]
-                else:
-                    targets[i][actions[i]] = rewards[i] + GAMMA * np.max(target_next[i])
-            
+            q_values_next = self.target_model(next_states, training=False).numpy()
+            max_q_next = np.max(q_values_next, axis=1)
+            targets = rewards + GAMMA * max_q_next * (1 - dones)
             with tf.GradientTape() as tape:
                 q_values = self.model(states, training=True)
-                q_values_selected = tf.reduce_sum(
-                    q_values * tf.one_hot(actions, self.max_action_size), axis=1)
-                loss = tf.reduce_mean(tf.square(targets - q_values))
-            
+                indices = tf.stack([tf.range(batch_size), actions], axis=1)
+                q_values_selected = tf.gather_nd(q_values, indices)
+                loss = tf.reduce_mean(tf.square(targets - q_values_selected))
             grads = tape.gradient(loss, self.model.trainable_variables)
             self.optimizer.apply_gradients(zip(grads, self.model.trainable_variables))
-            print(f"Replay: Trained on batch of {batch_size}, Loss {loss:.4f}")
-
-        if self.epsilon > self.epsilon_min:
-            self.epsilon *= self.epsilon_decay
-            print(f"Epsilon decayed to {self.epsilon:.3f}")
+        self.epsilon = max(self.epsilon_min, self.epsilon * EPSILON_DECAY)
 
 class LearningBasedAI:
     def __init__(self, player_id: int, state_size: int, max_action_size: int, model_type: str = 'dqn'):
@@ -525,7 +616,6 @@ class LearningBasedAI:
         state = env.encode_state()
         action_idx = self.agent.act(state, env)
         action = env.index_to_action(action_idx)
-        print(f"Choose discard: Action index {action_idx}, Selected cards {action}")
         return action if isinstance(action, list) and game.validate_discard(action) else [max(hand, key=lambda x: x.value)] if hand else []
 
     def should_pick_from_discard(self, discard_pile: List[Card], current_hand: List[Card], game_state: GameState, game: DhumbalGame) -> Tuple[bool, Optional[Card]]:
@@ -536,7 +626,6 @@ class LearningBasedAI:
         state = env.encode_state()
         action_idx = self.agent.act(state, env)
         action = env.index_to_action(action_idx)
-        print(f"Pick decision: Action index {action_idx}, Selected {action}")
         return (True, discard_pile[-1]) if action == 'discard' and discard_pile else (False, None)
 
     def should_call_jhyap(self, hand: List[Card], game_state: GameState, game: DhumbalGame) -> bool:
@@ -546,8 +635,19 @@ class LearningBasedAI:
         state = env.encode_state()
         action_idx = self.agent.act(state, env)
         action = env.index_to_action(action_idx)
-        print(f"Jhyap decision: Action index {action_idx}, Call Jhyap: {action}")
         return action
+
+def simulate_opponent_turn(env: DhumbalEnv, opponent: RuleBasedAI):
+    player = env.state.current_player
+    if env.state.phase == 'call':
+        action = opponent.should_call_jhyap(env.state.hands[player], env.state, env.game)
+    elif env.state.phase == 'discard':
+        action = opponent.choose_discard(env.state.hands[player], env.state, env.game)
+    else:  # pick
+        should_pick, _ = opponent.should_pick_from_discard(env.state.discard_pile, env.state.hands[player], env.state, env.game)
+        action = 'discard' if should_pick else 'deck'
+    next_state, _, done, log_entry = env.step(action)
+    return next_state, done, log_entry
 
 def train_agent(agent: LearningBasedAI, game: DhumbalGame, opponents: List[RuleBasedAI], batch_size: int):
     env = DhumbalEnv(game, [agent] + opponents, agent.player_id)
@@ -555,122 +655,85 @@ def train_agent(agent: LearningBasedAI, game: DhumbalGame, opponents: List[RuleB
     episode_turns = []
     best_win_rate = 0
     best_model = None
-    os.makedirs('/content', exist_ok=True)
-    csv_path = '/content/dqn_training_results.csv'
-    json_path = '/content/dqn_training_log.json'
+    csv_path = 'dqn_training_results.csv'
+    json_path = 'dqn_training_log.json'
     json_log = []
 
-    try:
-        with open(csv_path, 'w', newline='') as csvfile:
-            writer = csv.writer(csvfile)
-            writer.writerow(['Episode', 'Win', 'Turns', 'Reward'])
-            csvfile.flush()
-            for episode in range(TRAINING_EPISODES):
-                state = env.reset()
-                episode_reward = 0
-                turns = 0
-                episode_log = {
-                    'episode': episode + 1,
-                    'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                    'turns': [],
-                    'total_reward': 0,
-                    'winner': None,
-                    'epsilon': agent.agent.epsilon
-                }
-                print(f"\nStarting Episode {episode+1}/{TRAINING_EPISODES}")
-                while not env.state.done:
+    with open(csv_path, 'w', newline='') as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(['Episode', 'Win', 'Turns', 'Reward'])
+        csvfile.flush()
+        for episode in range(TRAINING_EPISODES):
+            state = env.reset()
+            episode_reward = 0
+            turns = 0
+            episode_log = {
+                'episode': episode + 1,
+                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'turns': [],
+                'total_reward': 0,
+                'winner': None,
+                'epsilon': agent.agent.epsilon
+            }
+            while not env.state.done:
+                if env.state.current_player == agent.player_id:
                     action_idx = agent.agent.act(state, env)
                     action = env.index_to_action(action_idx)
                     next_state, reward, done, log_entry = env.step(action)
                     agent.agent.remember(state, action_idx, reward, next_state, done)
-                    agent.agent.replay(batch_size)
                     episode_reward += reward
-                    turns += 1
                     state = next_state
-                    episode_log['turns'].append(log_entry)
-                    if done:
-                        break
-                    if (agent.agent.step_count + 1) % TARGET_UPDATE_FREQ == 0:
-                        agent.agent.update_target_model()
-                    agent.agent.step_count += 1
-                
-                episode_log['total_reward'] = episode_reward
-                episode_log['winner'] = env.state.winner
-                episode_log['epsilon'] = agent.agent.epsilon
-                json_log.append(episode_log)
-                
-                print(f"Episode {episode+1} ended after {turns} turns, Reward {episode_reward}, Winner {env.state.winner}")
-                writer.writerow([episode+1, 1 if env.state.winner == agent.player_id else 0, turns, episode_reward])
-                csvfile.flush()
-                win_rates.append(1 if env.state.winner == agent.player_id else 0)
-                episode_turns.append(turns)
-                
-                if episode == 0 or (episode + 1) % 500 == 0:
-                    agent.agent.model.save_weights('/content/dqn_model.weights.h5')
-                    agent.agent.target_model.save_weights('/content/dqn_target_model.weights.h5')
-                    print(f"Saved DQN models at episode {episode+1}")
-                    if os.path.exists('/content/dqn_model.weights.h5') and os.path.exists('/content/dqn_target_model.weights.h5'):
-                        print(f"Confirmed models saved: /content/dqn_model.weights.h5 and /content/dqn_target_model.weights.h5")
-                    else:
-                        print(f"Warning: Model files not found after saving attempt")
-                
-                if len(win_rates) >= CONVERGENCE_EPISODES:
-                    recent_win_rate = np.mean(win_rates[-CONVERGENCE_EPISODES:])
-                    if len(win_rates) >= 2 * CONVERGENCE_EPISODES and abs(recent_win_rate - np.mean(win_rates[-2*CONVERGENCE_EPISODES:-CONVERGENCE_EPISODES])) < CONVERGENCE_THRESHOLD:
-                        print(f"Convergence reached at episode {episode+1} with win rate {recent_win_rate:.3f}")
-                        break
-                    if recent_win_rate > best_win_rate:
-                        best_win_rate = recent_win_rate
-                        best_model = agent.agent.model.get_weights()
-                        agent.agent.model.save_weights('/content/dqn_model.weights.h5')
-                        agent.agent.target_model.save_weights('/content/dqn_target_model.weights.h5')
-                        print(f"Saved best DQN model at episode {episode+1} with win rate {best_win_rate:.3f}")
-                        if os.path.exists('/content/dqn_model.weights.h5') and os.path.exists('/content/dqn_target_model.weights.h5'):
-                            print(f"Confirmed best models saved: /content/dqn_model.weights.h5 and /content/dqn_target_model.weights.h5")
-                
-                if episode % 500 == 0:
-                    print(f"Training {agent.name}, Episode {episode+1}/{TRAINING_EPISODES}, Recent Win Rate: {np.mean(win_rates[-500:]) if win_rates else 0:.3f}, Avg Turns: {np.mean(episode_turns[-500:]) if episode_turns else 0:.1f}, Epsilon: {agent.agent.epsilon:.3f}")
-                
-                # Save JSON log periodically
-                if episode % 100 == 0 or done:
-                    with open(json_path, 'w') as f:
-                        json.dump(json_log, f, indent=2)
-                    if os.path.exists(json_path):
-                        file_size = os.path.getsize(json_path)
-                        print(f"JSON log saved to {json_path}, File size: {file_size} bytes")
+                else:
+                    opponent_idx = env.state.current_player - 1 if env.state.current_player > agent.player_id else env.state.current_player
+                    opponent = opponents[opponent_idx]
+                    next_state, done, log_entry = simulate_opponent_turn(env, opponent)
+                episode_log['turns'].append(log_entry)
+                turns += 1
+                if done:
+                    break
+            agent.agent.replay(batch_size)
+            if (agent.agent.step_count + 1) % TARGET_UPDATE_FREQ == 0:
+                agent.agent.update_target_model()
+            agent.agent.step_count += 1
+
+            episode_log['total_reward'] = episode_reward
+            episode_log['winner'] = env.state.winner
+            episode_log['epsilon'] = agent.agent.epsilon
+            json_log.append(episode_log)
+
+            win = 1 if env.state.winner == agent.player_id else 0
+            writer.writerow([episode + 1, win, turns, episode_reward])
+            csvfile.flush()
+            win_rates.append(win)
+            episode_turns.append(turns)
+
+            print(f"Episode {episode + 1}/{TRAINING_EPISODES}: Win={win}, Turns={turns}, Reward={episode_reward:.2f}, Epsilon={agent.agent.epsilon:.4f}")
+
+            if len(win_rates) >= CONVERGENCE_EPISODES:
+                recent_win_rate = np.mean(win_rates[-CONVERGENCE_EPISODES:])
+                if len(win_rates) >= 2 * CONVERGENCE_EPISODES and abs(recent_win_rate - np.mean(win_rates[-2*CONVERGENCE_EPISODES:-CONVERGENCE_EPISODES])) < CONVERGENCE_THRESHOLD:
+                    break
+                if recent_win_rate > best_win_rate:
+                    best_win_rate = recent_win_rate
+                    best_model = agent.agent.model.get_weights()
+                    agent.agent.model.save_weights(f'dqn_model_ep{episode+1}.weights.h5')
+                    agent.agent.target_model.save_weights(f'dqn_target_model_ep{episode+1}.weights.h5')
+
+            with open(json_path, 'w') as f:
+                json.dump(json_log, f, indent=2)
             
-            if best_model:
-                agent.agent.model.set_weights(best_model)
-                print("Restored best model weights")
-            agent.agent.model.save_weights('/content/dqn_model.weights.h5')
-            agent.agent.target_model.save_weights('/content/dqn_target_model.weights.h5')
-            print("Final DQN models saved to /content/dqn_model.weights.h5 and /content/dqn_target_model.weights.h5")
-            if os.path.exists('/content/dqn_model.weights.h5') and os.path.exists('/content/dqn_target_model.weights.h5'):
-                print(f"Confirmed final models saved: /content/dqn_model.weights.h5 and /content/dqn_target_model.weights.h5")
-            if os.path.exists(csv_path):
-                file_size = os.path.getsize(csv_path)
-                print(f"Training results saved to {csv_path}, File size: {file_size} bytes")
-                with open(csv_path, 'r') as f:
-                    content = f.read()
-                    print(f"CSV content preview: {content[:200]}...")
-            if os.path.exists(json_path):
-                file_size = os.path.getsize(json_path)
-                print(f"Final JSON log saved to {json_path}, File size: {file_size} bytes")
-                with open(json_path, 'r') as f:
-                    content = f.read()
-                    print(f"JSON log preview: {content[:200]}...")
-    except Exception as e:
-        print(f"Error during training: {e}")
-        with open(json_path, 'w') as f:
-            json.dump(json_log, f, indent=2)
-        raise
-    
+            agent.agent.model.save_weights(f'dqn_model_ep_last.weights.h5')
+            agent.agent.target_model.save_weights(f'dqn_target_ model_ep_last.weights.h5')
+
+
+    if best_model:
+        agent.agent.model.set_weights(best_model)
     return best_win_rate
 
 if __name__ == "__main__":
     game = DhumbalGame(num_players=NUM_PLAYERS)
-    state_size = 52 + 52  # Hand + discard pile encoding
-    max_action_size = 5   # Max single-card discards
+    state_size = 52 + 52 + 5 + 5 + 3  # Hand + discard + player_one_hot + features + phase = 117
+    max_action_size = 128
     dqn_player = LearningBasedAI(0, state_size, max_action_size, model_type='dqn')
     opponents = [
         RuleBasedAI(1, AIStyle.CONSERVATIVE),
@@ -678,6 +741,5 @@ if __name__ == "__main__":
         RuleBasedAI(3, AIStyle.OPPORTUNISTIC),
         RuleBasedAI(4, AIStyle.BALANCED)
     ]
-    print("Training DQN Agent...")
     win_rate = train_agent(dqn_player, game, opponents, BATCH_SIZE)
     print(f"DQN Training Complete. Best Win Rate: {win_rate:.3f}")
