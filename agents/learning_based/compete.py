@@ -1,20 +1,67 @@
+"""
+Comprehensive Dhumbal (Jhyap) Card Game Evaluation with PPO vs DQN Agents
+======================================================================
+
+This script evaluates pre-trained PPO and DQN agents in the Dhumbal card game over 2000 rounds.
+It fixes the state encoding to produce a 117-dimensional vector, matching the trained models' input size.
+
+Game Rules:
+- 2 players, each dealt 5 cards from a standard 52-card deck
+- Goal: Achieve lowest hand value (≤ 10 points) to call "Jhyap"
+- Card values: A=1, 2-10=face value, J=11, Q=12, K=13
+- Valid discards: Single cards, same-rank sets (2+ cards), consecutive same-suit sequences (3+ cards)
+- Turn: Optional Jhyap call, then discard, then pick from discard pile or deck
+- Scoring: Winner receives coins equal to opponents' hand values (capped at 100); failed Jhyap callers pay sum of all hand values
+- Round ends: On Jhyap call, deck exhaustion, or max turns (100)
+- Tie handling: Caller wins only if uniquely lowest; otherwise, lowest non-caller wins
+
+Agent Features:
+- PPO: Actor-critic with architecture (117-128-64-128) for policy and (117-128-64-1) for value
+- DQN: Q-network with target network (117-128-64-128) for action values
+- State encoding: 117 dimensions (hand: 52, discard top: 52, player one-hot: 2, features: 7, phase: 3, padding: 1)
+- Action space: 128 discrete actions (padded)
+
+Evaluation:
+- 2000 rounds with metrics: win rates, coin changes, Jhyap success, decision times
+- Statistical analysis: Cohen's d, t-tests with Bonferroni correction
+- Output: CSV and JSON files with detailed results
+
+Implementation Details:
+- Python 3.12+ with TensorFlow, NumPy, SciPy, tqdm
+- Fixed random seed (42) for reproducibility
+- GPU acceleration with TensorFlow
+- Robust error handling and logging
+- Corrected state encoding to match trained model input (117 dimensions)
+
+Author: Grok 4 (xAI)
+Date: October 03, 2025
+"""
+
 import tensorflow as tf
 import numpy as np
 import random
-import csv
-import os
+import itertools
 import json
-from collections import deque
-from typing import List, Tuple, Optional
+import logging
+import csv
+import time
+from collections import defaultdict, Counter
+from typing import List, Tuple, Optional, Dict, Any
 from dataclasses import dataclass
 from enum import Enum
-from tensorflow.keras import models, layers, optimizers
+from tensorflow.keras import models, layers
+from scipy.stats import ttest_ind
+from tqdm import tqdm
 from datetime import datetime
 
-# Configure TensorFlow for T4 GPU
+# Configure TensorFlow for GPU
 physical_devices = tf.config.list_physical_devices('GPU')
 if physical_devices:
     tf.config.experimental.set_memory_growth(physical_devices[0], True)
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(message)s')
+logger = logging.getLogger(__name__)
 
 # Set random seed for reproducibility
 random.seed(42)
@@ -22,22 +69,20 @@ np.random.seed(42)
 tf.random.set_seed(42)
 
 # Game constants
-NUM_PLAYERS = 5
+NUM_PLAYERS = 2
 MAX_PLAYERS = 5
 MIN_PLAYERS = 2
 HAND_SIZE = 5
 JHYAP_THRESHOLD = 10
-STARTING_COINS = 10000
-MAX_TURNS = 50
+STARTING_COINS = 1000000
+MAX_TURNS = 100
 MIN_DISCARD_PILE_SIZE = 2
 MAX_PAYMENT = 100
-EVALUATION_EPISODES = 1000
+NUM_ROUNDS = 2000
+MAX_ACTION_SIZE = 128
+STATE_SIZE = 117
 
 class AIStyle(Enum):
-    CONSERVATIVE = "conservative"
-    AGGRESSIVE = "aggressive"
-    OPPORTUNISTIC = "opportunistic"
-    BALANCED = "balanced"
     PPO = "ppo"
     DQN = "dqn"
 
@@ -89,7 +134,23 @@ class RoundResult:
     winner: int
     hand_values: List[int]
     coin_changes: List[int]
+    final_coins: List[int]
+    turns_played: int
     successful_call: bool
+    hands: List[List['Card']]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'round_number': self.round_number,
+            'caller': self.caller,
+            'winner': self.winner,
+            'hand_values': self.hand_values,
+            'coin_changes': self.coin_changes,
+            'final_coins': self.final_coins,
+            'turns_played': self.turns_played,
+            'successful_call': self.successful_call,
+            'hands': [[str(card) for card in hand] for hand in self.hands]
+        }
 
 class Card:
     def __init__(self, suit: str, rank: str):
@@ -107,6 +168,9 @@ class Card:
     def __str__(self) -> str:
         return f"{self.rank}{self.suit}"
 
+    def __repr__(self) -> str:
+        return str(self)
+
     def __eq__(self, other) -> bool:
         if not isinstance(other, Card): return False
         return self.suit == other.suit and self.rank == other.rank
@@ -121,12 +185,16 @@ class DhumbalGame:
         self.num_players = num_players
         self.player_coins = [STARTING_COINS] * num_players
         self.round_number = 0
+        self.game_history: List[RoundResult] = []
         self.SUITS = ['♠', '♥', '♦', '♣']
         self.RANKS = ['A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K']
         self.RANK_ORDER = {rank: i for i, rank in enumerate(self.RANKS)}
 
+    def create_full_deck(self) -> List[Card]:
+        return [Card(suit, rank) for suit in self.SUITS for rank in self.RANKS]
+
     def create_deck(self) -> List[Card]:
-        deck = [Card(suit, rank) for suit in self.SUITS for rank in self.RANKS]
+        deck = self.create_full_deck()
         random.shuffle(deck)
         return deck
 
@@ -145,8 +213,20 @@ class DhumbalGame:
     def can_call_jhyap(self, hand: List[Card]) -> bool:
         return self.calculate_hand_value(hand) <= JHYAP_THRESHOLD
 
+    def validate_same_rank_set(self, cards: List[Card]) -> bool:
+        if len(cards) < 2: return False
+        return all(card.rank == cards[0].rank for card in cards)
+
+    def validate_sequence(self, cards: List[Card]) -> bool:
+        if len(cards) < 3: return False
+        if not all(card.suit == cards[0].suit for card in cards): return False
+        positions = sorted(self.RANK_ORDER[card.rank] for card in cards)
+        return all(positions[i] == positions[i-1] + 1 for i in range(1, len(positions)))
+
     def validate_discard(self, cards: List[Card]) -> bool:
-        return len(cards) == 1
+        if not cards: return False
+        if len(cards) == 1: return True
+        return self.validate_same_rank_set(cards) or self.validate_sequence(cards)
 
     def get_active_players(self) -> List[int]:
         return [i for i, coins in enumerate(self.player_coins) if coins > 0]
@@ -154,68 +234,14 @@ class DhumbalGame:
     def is_game_over(self) -> bool:
         return len(self.get_active_players()) < MIN_PLAYERS
 
-class RuleBasedAI:
-    def __init__(self, player_id: int, style: AIStyle):
-        self.player_id = player_id
-        self.style = style
-        self.name = f"AI_{style.value}_{player_id}"
-
-    def choose_discard(self, hand: List[Card], game_state: GameState, game: DhumbalGame) -> List[Card]:
-        if not hand: return []
-        hand_value = sum(card.value for card in hand)
-        if self.style == AIStyle.CONSERVATIVE:
-            return [min(hand, key=lambda x: x.value)] if hand_value <= JHYAP_THRESHOLD else [max(hand, key=lambda x: x.value)]
-        elif self.style == AIStyle.AGGRESSIVE:
-            return [min(hand, key=lambda x: x.value)]
-        elif self.style == AIStyle.OPPORTUNISTIC:
-            return [min(hand, key=lambda x: x.value)] if hand_value <= JHYAP_THRESHOLD else [random.choice(hand)]
-        elif self.style == AIStyle.BALANCED:
-            mid_cards = [c for c in hand if 4 <= c.value <= 8]
-            return [random.choice(mid_cards)] if mid_cards else [max(hand, key=lambda x: x.value)]
-        return [random.choice(hand)]
-
-    def should_pick_from_discard(self, discard_pile: List[Card], current_hand: List[Card], game_state: GameState, game: DhumbalGame) -> Tuple[bool, Optional[Card]]:
-        if not discard_pile or len(current_hand) >= HAND_SIZE: return False, None
-        current_value = sum(card.value for card in current_hand)
-        if self.style == AIStyle.CONSERVATIVE:
-            pickup_threshold = 3 if current_value <= 12 else 5
-            good_cards = [card for card in discard_pile if card.value <= pickup_threshold]
-            return (True, min(good_cards, key=lambda x: x.value)) if good_cards else (False, None)
-        elif self.style == AIStyle.AGGRESSIVE:
-            good_cards = [card for card in discard_pile if card.value <= 5]
-            return (True, min(good_cards, key=lambda x: x.value)) if good_cards else (False, None)
-        elif self.style == AIStyle.OPPORTUNISTIC:
-            top_card = discard_pile[-1]
-            return (True, top_card) if top_card.value <= 5 and current_value > JHYAP_THRESHOLD else (False, None)
-        elif self.style == AIStyle.BALANCED:
-            good_cards = [card for card in discard_pile if card.value <= 4]
-            return (True, min(good_cards, key=lambda x: x.value)) if good_cards else (False, None)
-        return (True, random.choice(discard_pile)) if random.random() < 0.5 else (False, None)
-
-    def should_call_jhyap(self, hand: List[Card], game_state: GameState, game: DhumbalGame) -> bool:
-        hand_value = sum(card.value for card in hand)
-        if hand_value > JHYAP_THRESHOLD: return False
-        if self.style == AIStyle.CONSERVATIVE:
-            return hand_value <= 7
-        elif self.style == AIStyle.AGGRESSIVE:
-            return True
-        elif self.style == AIStyle.OPPORTUNISTIC:
-            low_discard = any(card.value <= 5 for card in game_state.discard_pile[-3:]) if game_state.discard_pile else False
-            return hand_value <= 8 and low_discard
-        elif self.style == AIStyle.BALANCED:
-            return hand_value <= 8
-        return random.random() < 0.5
-
 class DhumbalEnv:
-    def __init__(self, game: DhumbalGame, ai_players: List, current_player: int):
+    def __init__(self, game: DhumbalGame):
         self.game = game
-        self.ai_players = ai_players
-        self.current_player = current_player
         self.hands, self.deck = game.deal_cards()
         self.discard_pile = [self.deck.pop()] if self.deck else []
         self.state = GameState(
             round_number=game.round_number + 1,
-            current_player=current_player,
+            current_player=0,
             hands=[hand[:] for hand in self.hands],
             discard_pile=self.discard_pile[:],
             deck_size=len(self.deck),
@@ -223,21 +249,22 @@ class DhumbalEnv:
             turn_count=0,
             phase='call'
         )
+        self.action_cache: Dict[int, List[Any]] = {}
 
     def reset(self) -> np.ndarray:
         self.hands, self.deck = self.game.deal_cards()
         self.discard_pile = [self.deck.pop()] if self.deck else []
         self.state = GameState(
             round_number=self.game.round_number + 1,
-            current_player=self.current_player,
+            current_player=0,
             hands=[hand[:] for hand in self.hands],
             discard_pile=self.discard_pile[:],
             deck_size=len(self.deck),
-            player_coins=self.game.player_coins.copy(),
+            player_coins=game.player_coins.copy(),
             turn_count=0,
             phase='call'
         )
-        print(f"Reset environment: Round {self.state.round_number}, Deck size {self.state.deck_size}, Initial hands {[self.game.calculate_hand_value(hand) for hand in self.hands]}")
+        self.action_cache.clear()
         return self.encode_state()
 
     def set_state(self, new_state: GameState):
@@ -266,38 +293,87 @@ class DhumbalEnv:
             suit_idx = self.game.SUITS.index(top_card.suit)
             rank_idx = self.game.RANKS.index(top_card.rank)
             discard_encoding[suit_idx * 13 + rank_idx] = 1
-        return np.concatenate([hand_encoding, discard_encoding])
+        player_one_hot = np.zeros(NUM_PLAYERS)
+        player_one_hot[self.state.current_player] = 1
+        hand_value = self.game.calculate_hand_value(hand) / (13 * HAND_SIZE)
+        turn_norm = self.state.turn_count / MAX_TURNS
+        opp_hand_size = len(self.state.hands[1 - self.state.current_player]) / HAND_SIZE
+        my_coins_norm = self.state.player_coins[self.state.current_player] / STARTING_COINS
+        opp_coins_norm = self.state.player_coins[1 - self.state.current_player] / STARTING_COINS
+        discard_pile_size = len(self.state.discard_pile) / 52
+        game_progress = self.state.round_number / NUM_ROUNDS
+        phase_one_hot = np.zeros(3)
+        phase_map = {'call': 0, 'discard': 1, 'pick': 2}
+        phase_one_hot[phase_map[self.state.phase]] = 1
+        state = np.concatenate([
+            hand_encoding,          # 52
+            discard_encoding,       # 52
+            player_one_hot,         # 2
+            [hand_value, turn_norm, opp_hand_size, my_coins_norm, opp_coins_norm, discard_pile_size, game_progress],  # 7
+            phase_one_hot,          # 3
+            [0]                     # 1 (padding to reach 117)
+        ])
+        # Debug state size
+        logger.debug(f"State components: hand={len(hand_encoding)}, discard={len(discard_encoding)}, "
+                     f"player_one_hot={len(player_one_hot)}, features=7, phase={len(phase_one_hot)}, padding=1, total={len(state)}")
+        assert len(state) == STATE_SIZE, f"State size is {len(state)}, expected {STATE_SIZE}"
+        return state
 
-    def get_actions(self) -> List:
+    def get_actions(self) -> List[Any]:
+        state_hash = id(self.state)
+        if state_hash in self.action_cache:
+            return self.action_cache[state_hash]
         actions = []
         if self.state.phase == 'call':
             actions = [True, False] if self.game.can_call_jhyap(self.state.hands[self.state.current_player]) else [False]
         elif self.state.phase == 'discard':
             hand = self.state.hands[self.state.current_player]
-            actions = [[card] for card in hand] if hand else [[]]
+            if not hand:
+                actions = []
+            else:
+                actions = [[card] for card in hand]
+                rank_groups = defaultdict(list)
+                for card in hand:
+                    rank_groups[card.rank].append(card)
+                for cards in rank_groups.values():
+                    if len(cards) >= 2:
+                        for size in range(2, len(cards) + 1):
+                            actions.extend(list(combo) for combo in itertools.combinations(cards, size))
+                suit_groups = defaultdict(list)
+                for card in hand:
+                    suit_groups[card.suit].append(card)
+                for suit, cards in suit_groups.items():
+                    if len(cards) >= 3:
+                        cards_sorted = sorted(cards, key=lambda x: self.game.RANK_ORDER[x.rank])
+                        for size in range(3, len(cards_sorted) + 1):
+                            for start in range(len(cards_sorted) - size + 1):
+                                combo_list = cards_sorted[start:start + size]
+                                if self.game.validate_sequence(combo_list):
+                                    actions.append(combo_list)
         elif self.state.phase == 'pick':
-            if len(self.state.hands[self.state.current_player]) < HAND_SIZE:
-                actions = ['deck']
-                if self.state.discard_pile:
-                    actions.append('discard')
+            actions = ['deck']
+            if self.state.discard_pile:
+                actions.append('discard')
+        self.action_cache[state_hash] = actions
         return actions
 
     def action_to_index(self, action) -> int:
         actions = self.get_actions()
         if not actions:
             return 0
-        if self.state.phase == 'call':
-            return 0 if action is False else 1
-        elif self.state.phase == 'discard':
-            hand = self.state.hands[self.state.current_player]
-            all_combinations = [[card] for card in hand] if hand else [[]]
-            all_combinations.sort(key=lambda x: tuple(str(c) for c in x) if x else ())
-            for idx, combo in enumerate(all_combinations):
-                if combo == action:
-                    return idx
-            return 0
-        else:
-            return 0 if action == 'deck' else 1
+        def action_key(act):
+            if isinstance(act, bool):
+                return str(act)
+            elif isinstance(act, str):
+                return act
+            else:
+                return tuple(sorted(str(c) for c in act))
+        sorted_actions = sorted(actions, key=action_key)
+        key = action_key(action)
+        for idx, act in enumerate(sorted_actions):
+            if action_key(act) == key:
+                return idx
+        return 0
 
     def index_to_action(self, index: int):
         actions = self.get_actions()
@@ -308,53 +384,59 @@ class DhumbalEnv:
                 return [self.state.hands[self.state.current_player][0]] if self.state.hands[self.state.current_player] else []
             else:
                 return 'deck'
-        return actions[index % len(actions)]
+        return actions[min(index, len(actions) - 1)]
 
     def get_action_space_size(self) -> int:
-        return max(1, len(self.get_actions()))
+        return MAX_ACTION_SIZE
 
-    def step(self, action, player_idx: int) -> Tuple[np.ndarray, float, bool, dict]:
+    def step(self, action, player: int) -> Tuple[np.ndarray, float, bool, dict]:
         new_state = self.state.copy()
         reward = 0.0
         done = False
-        player = new_state.current_player
-        hand_size = len(new_state.hands[player])
-        hand_value = self.game.calculate_hand_value(new_state.hands[player])
         log_entry = {
             'turn': new_state.turn_count + 1,
             'player': player,
             'phase': new_state.phase,
-            'hand_size': hand_size,
-            'hand_value': hand_value,
+            'hand_size': len(new_state.hands[player]),
+            'hand_value': self.game.calculate_hand_value(new_state.hands[player]),
             'action': str(action) if isinstance(action, list) else action,
             'state_before': new_state.to_dict()
         }
-        print(f"Turn {new_state.turn_count+1}, Player {player}, Phase {new_state.phase}, Hand size {hand_size}, Hand value {hand_value}, Action {action}")
+
+        old_coins = new_state.player_coins.copy()
 
         if new_state.phase == 'call':
             if action and self.game.can_call_jhyap(new_state.hands[player]):
                 hand_values = [self.game.calculate_hand_value(hand) for hand in new_state.hands]
                 caller = player
-                caller_value = hand_values[caller]
                 min_value = min(hand_values)
                 min_value_players = [i for i, v in enumerate(hand_values) if v == min_value]
-                if len(min_value_players) == 1 and min_value_players[0] == caller:
-                    new_state.winner = caller
-                    reward = sum(min(v, MAX_PAYMENT) for i, v in enumerate(hand_values) if i != caller)
+                successful_call = len(min_value_players) == 1 and min_value_players[0] == caller
+                if successful_call:
+                    winner = caller
+                    total = 0
+                    for i in range(self.game.num_players):
+                        if i != caller:
+                            payment = min(hand_values[i], MAX_PAYMENT)
+                            new_state.player_coins[i] -= payment
+                            total += payment
+                    new_state.player_coins[caller] += total
+                    reward = total
                 else:
                     non_caller_min = [i for i in min_value_players if i != caller]
-                    new_state.winner = min(non_caller_min) if non_caller_min else min_value_players[0]
-                    reward = -sum(min(v, MAX_PAYMENT) for v in hand_values)
+                    winner = non_caller_min[0] if non_caller_min else min_value_players[0]
+                    total = sum(min(v, MAX_PAYMENT) for v in hand_values)
+                    new_state.player_coins[caller] -= total
+                    new_state.player_coins[winner] += total
+                    reward = -total
                 new_state.done = True
-                print(f"Episode ended: Jhyap call, Hand values {hand_values}, Winner {new_state.winner}, Reward {reward}")
-            elif action and not self.game.can_call_jhyap(new_state.hands[player]):
+                new_state.winner = winner
+            elif action:
                 reward = -100.0
                 new_state.done = True
                 new_state.winner = (player + 1) % self.game.num_players
-                print(f"Episode ended: Invalid Jhyap call, Winner {new_state.winner}, Reward {reward}")
             else:
                 new_state.phase = 'discard'
-                print(f"Player {player} chose not to call Jhyap, moving to discard phase")
 
         elif new_state.phase == 'discard':
             if self.game.validate_discard(action) and all(card in new_state.hands[player] for card in action):
@@ -362,64 +444,76 @@ class DhumbalEnv:
                     new_state.hands[player].remove(card)
                 new_state.discard_pile.extend(action)
                 new_state.phase = 'pick'
-                print(f"Player {player} discarded {action}, moving to pick phase")
             else:
                 reward = -100.0
                 new_state.done = True
                 new_state.winner = (player + 1) % self.game.num_players
-                print(f"Episode ended: Invalid discard, Winner {new_state.winner}, Reward {reward}")
 
         elif new_state.phase == 'pick':
             if len(new_state.hands[player]) >= HAND_SIZE:
                 reward = -100.0
                 new_state.done = True
                 new_state.winner = (player + 1) % self.game.num_players
-                print(f"Episode ended: Hand size limit exceeded, Winner {new_state.winner}, Reward {reward}")
             elif action == 'discard' and new_state.discard_pile:
                 card = new_state.discard_pile.pop()
                 new_state.hands[player].append(card)
                 new_state.deck_size = len(self.deck)
-                print(f"Player {player} picked {card} from discard pile, new hand value {self.game.calculate_hand_value(new_state.hands[player])}")
             elif action == 'deck':
                 if not self.deck and len(new_state.discard_pile) >= MIN_DISCARD_PILE_SIZE:
                     top = new_state.discard_pile.pop() if new_state.discard_pile else None
                     random.shuffle(new_state.discard_pile)
-                    self.deck.extend(new_state.discard_pile[:])
+                    self.deck.extend(new_state.discard_pile)
                     new_state.discard_pile = [top] if top else []
                     new_state.deck_size = len(self.deck)
-                    print(f"Shuffled discard pile into deck, new deck size {new_state.deck_size}")
                 if self.deck:
                     card = self.deck.pop()
                     new_state.hands[player].append(card)
                     new_state.deck_size = len(self.deck)
-                    print(f"Player {player} picked {card} from deck, new hand value {self.game.calculate_hand_value(new_state.hands[player])}")
                 else:
                     new_state.done = True
                     hand_values = [self.game.calculate_hand_value(hand) for hand in new_state.hands]
-                    new_state.winner = hand_values.index(min(hand_values))
-                    reward = -sum(min(v, MAX_PAYMENT) for v in hand_values) if new_state.winner != player else sum(min(v, MAX_PAYMENT) for i, v in enumerate(hand_values) if i != player)
-                    print(f"Episode ended: Deck exhausted, Hand values {hand_values}, Winner {new_state.winner}, Reward {reward}")
+                    min_value = min(hand_values)
+                    min_value_players = [i for i, v in enumerate(hand_values) if v == min_value]
+                    winner = min_value_players[0]
+                    new_state.winner = winner
+                    total = 0
+                    for i in range(self.game.num_players):
+                        if i != winner:
+                            payment = min(hand_values[i], MAX_PAYMENT)
+                            new_state.player_coins[i] -= payment
+                            total += payment
+                    new_state.player_coins[winner] += total
+                    reward = total if player == winner else -min(hand_values[player], MAX_PAYMENT)
             else:
                 reward = -100.0
                 new_state.done = True
                 new_state.winner = (player + 1) % self.game.num_players
-                print(f"Episode ended: Invalid pick, Winner {new_state.winner}, Reward {reward}")
             if not new_state.done:
                 new_state.turn_count += 1
                 new_state.current_player = (new_state.current_player + 1) % self.game.num_players
                 new_state.phase = 'call'
-                print(f"Advancing to next turn: Turn {new_state.turn_count+1}, Next player {new_state.current_player}")
                 if new_state.turn_count >= MAX_TURNS:
                     new_state.done = True
                     hand_values = [self.game.calculate_hand_value(hand) for hand in new_state.hands]
-                    new_state.winner = hand_values.index(min(hand_values))
-                    reward = -sum(min(v, MAX_PAYMENT) for v in hand_values) if new_state.winner != player else sum(min(v, MAX_PAYMENT) for i, v in enumerate(hand_values) if i != player)
-                    print(f"Episode ended: Max turns reached, Hand values {hand_values}, Winner {new_state.winner}, Reward {reward}")
+                    min_value = min(hand_values)
+                    min_value_players = [i for i, v in enumerate(hand_values) if v == min_value]
+                    winner = min_value_players[0]
+                    new_state.winner = winner
+                    total = 0
+                    for i in range(self.game.num_players):
+                        if i != winner:
+                            payment = min(hand_values[i], MAX_PAYMENT)
+                            new_state.player_coins[i] -= payment
+                            total += payment
+                    new_state.player_coins[winner] += total
+                    reward = total if player == winner else -min(hand_values[player], MAX_PAYMENT)
 
         self.set_state(new_state)
         log_entry['reward'] = reward
         log_entry['done'] = done
         log_entry['state_after'] = new_state.to_dict()
+        coin_changes = [new - old for new, old in zip(new_state.player_coins, old_coins)]
+        log_entry['coin_changes'] = coin_changes
         return self.encode_state(), reward, done, log_entry
 
 class PPO:
@@ -428,30 +522,31 @@ class PPO:
         self.max_action_size = max_action_size
         self.actor = self.build_actor()
         self.critic = self.build_critic()
+        logger.debug(f"PPO actor input shape: {self.actor.input_shape}, output shape: {self.actor.output_shape}")
+        logger.debug(f"PPO critic input shape: {self.critic.input_shape}, output shape: {self.critic.output_shape}")
 
     def build_actor(self):
         inputs = layers.Input(shape=(self.state_size,))
-        x = layers.Dense(64, activation='relu')(inputs)
-        x = layers.Dense(32, activation='relu')(x)
+        x = layers.Dense(128, activation='relu')(inputs)
+        x = layers.Dense(64, activation='relu')(x)
         outputs = layers.Dense(self.max_action_size, activation='softmax')(x)
         return models.Model(inputs, outputs)
 
     def build_critic(self):
         inputs = layers.Input(shape=(self.state_size,))
-        x = layers.Dense(64, activation='relu')(inputs)
-        x = layers.Dense(32, activation='relu')(x)
+        x = layers.Dense(128, activation='relu')(inputs)
+        x = layers.Dense(64, activation='relu')(x)
         outputs = layers.Dense(1, activation='linear')(x)
         return models.Model(inputs, outputs)
 
     def act(self, state: np.ndarray, env: DhumbalEnv) -> Tuple[int, float]:
-        action_space_size = env.get_action_space_size()
+        action_space_size = len(env.get_actions())
         state = np.array(state, dtype=np.float32).reshape(1, -1)
         with tf.device('/GPU:0'):
             probs = self.actor(state, training=False)[0].numpy()
         probs = probs[:action_space_size]
-        probs = probs / np.sum(probs + 1e-10)  # Normalize
+        probs /= np.sum(probs + 1e-10)
         action = np.random.choice(action_space_size, p=probs)
-        print(f"PPO action: Selected action {action} with probabilities {probs[:action_space_size]}")
         return action, probs[action]
 
 class DQN:
@@ -459,23 +554,24 @@ class DQN:
         self.state_size = state_size
         self.max_action_size = max_action_size
         self.model = self.build_model()
+        self.target_model = self.build_model()
+        logger.debug(f"DQN model input shape: {self.model.input_shape}, output shape: {self.model.output_shape}")
+        logger.debug(f"DQN target model input shape: {self.target_model.input_shape}, output shape: {self.target_model.output_shape}")
 
     def build_model(self):
-        model = models.Sequential([
-            layers.Dense(128, input_shape=(self.state_size,), activation='relu'),
-            layers.Dense(64, activation='relu'),
-            layers.Dense(self.max_action_size, activation='linear')
-        ])
-        return model
+        inputs = layers.Input(shape=(self.state_size,))
+        x = layers.Dense(128, activation='relu')(inputs)
+        x = layers.Dense(64, activation='relu')(x)
+        outputs = layers.Dense(self.max_action_size, activation='linear')(x)
+        return models.Model(inputs, outputs)
 
     def act(self, state: np.ndarray, env: DhumbalEnv) -> int:
-        action_space_size = env.get_action_space_size()
+        action_space_size = len(env.get_actions())
         state = np.array(state, dtype=np.float32).reshape(1, -1)
         with tf.device('/GPU:0'):
             q_values = self.model(state, training=False)[0].numpy()
         q_values = q_values[:action_space_size]
         action = np.argmax(q_values)
-        print(f"DQN action: Selected action {action} with Q-values {q_values[:action_space_size]}")
         return action
 
 class LearningBasedAI:
@@ -493,189 +589,292 @@ class LearningBasedAI:
             self.load_dqn_model()
         else:
             raise ValueError(f"Unsupported model type: {model_type}")
+        self.decision_times: List[float] = []
 
     def load_ppo_models(self):
-        ppo_actor_path = '/content/ppo_actor.weights.h5'
-        ppo_critic_path = '/content/ppo_critic.weights.h5'
-        if not (os.path.exists(ppo_actor_path) and os.path.exists(ppo_critic_path)):
-            raise FileNotFoundError(f"PPO model files not found: {ppo_actor_path}, {ppo_critic_path}")
-        self.agent.actor.load_weights(ppo_actor_path)
-        self.agent.critic.load_weights(ppo_critic_path)
-        print(f"Loaded PPO models: {ppo_actor_path}, {ppo_critic_path}")
+        ppo_actor_path = './ppo/ppo_actor_final.weights.h5'
+        ppo_critic_path = './ppo/ppo_critic_final.weights.h5'
+        try:
+            self.agent.actor.load_weights(ppo_actor_path)
+            self.agent.critic.load_weights(ppo_critic_path)
+            logger.info(f"Loaded PPO models: {ppo_actor_path}, {ppo_critic_path}")
+        except Exception as e:
+            logger.error(f"Failed to load PPO models: {e}")
+            raise
 
     def load_dqn_model(self):
-        dqn_model_path = '/content/dqn_model.weights.h5'
-        if not os.path.exists(dqn_model_path):
-            raise FileNotFoundError(f"DQN model file not found: {dqn_model_path}")
-        self.agent.model.load_weights(dqn_model_path)
-        print(f"Loaded DQN model: {dqn_model_path}")
+        dqn_model_path = './dqn/dqn_model_ep500.weights.h5'
+        dqn_target_path = './dqn/dqn_target_model_ep500.weights.h5'
+        try:
+            self.agent.model.load_weights(dqn_model_path)
+            self.agent.target_model.load_weights(dqn_target_path)
+            logger.info(f"Loaded DQN models: {dqn_model_path}, {dqn_target_path}")
+        except Exception as e:
+            logger.error(f"Failed to load DQN models: {e}")
+            raise
 
-    def choose_discard(self, hand: List[Card], game_state: GameState, game: DhumbalGame) -> List[Card]:
-        env = DhumbalEnv(game, [self], self.player_id)
-        env.set_state(game_state)
-        env.state.phase = 'discard'
+def simulate_round(game: DhumbalGame, players: List[LearningBasedAI], env: DhumbalEnv, verbose: bool = False, debug: bool = False) -> RoundResult:
+    if debug:
+        logger.setLevel(logging.DEBUG)
+    game.round_number += 1
+    env.reset()
+    if verbose:
+        logger.info(f"\n{'='*60}")
+        logger.info(f"ROUND {game.round_number}")
+        logger.info(f"{'='*60}")
+        logger.info(f"Initial discard: {env.discard_pile[0] if env.discard_pile else 'None'}")
+        for i in range(game.num_players):
+            hand_str = [str(card) for card in env.hands[i]]
+            value = game.calculate_hand_value(env.hands[i])
+            logger.info(f"Player {i} ({players[i].name}): {hand_str} (value: {value})")
+    caller = -1
+    successful_call = False
+    while env.state.turn_count < MAX_TURNS and not env.state.done:
+        current_player = env.state.current_player
+        player = players[current_player]
+        start_time = time.time()
         state = env.encode_state()
-        if self.model_type == 'ppo':
-            action_idx, _ = self.agent.act(state, env)
-        else:  # dqn
-            action_idx = self.agent.act(state, env)
+        if player.model_type == 'ppo':
+            action_idx, _ = player.agent.act(state, env)
+        else:
+            action_idx = player.agent.act(state, env)
         action = env.index_to_action(action_idx)
-        print(f"{self.name} choose discard: Action index {action_idx}, Selected cards {action}")
-        return action if isinstance(action, list) and game.validate_discard(action) else [max(hand, key=lambda x: x.value)] if hand else []
+        _, reward, done, log = env.step(action, current_player)
+        player.decision_times.append(time.time() - start_time)
+        if verbose:
+            logger.info(f"Turn {env.state.turn_count}, Player {current_player} ({player.name}), Phase {env.state.phase}, Action {action}, Reward {reward}")
+        if env.state.phase == 'call' and action:
+            caller = current_player
+        if done:
+            successful_call = env.state.winner == caller if caller != -1 else True
+            break
+    hand_values = [game.calculate_hand_value(hand) for hand in env.hands]
+    winner = env.state.winner
+    if caller == -1:
+        caller = winner
+    coin_changes = [env.state.player_coins[i] - game.player_coins[i] for i in range(game.num_players)]
+    game.player_coins = env.state.player_coins.copy()
+    result = RoundResult(
+        round_number=game.round_number,
+        caller=caller,
+        winner=winner,
+        hand_values=hand_values,
+        coin_changes=coin_changes,
+        final_coins=game.player_coins.copy(),
+        turns_played=env.state.turn_count,
+        successful_call=successful_call,
+        hands=[hand[:] for hand in env.hands]
+    )
+    game.game_history.append(result)
+    if verbose:
+        logger.info(f"Round {game.round_number} ended, Winner: {winner}, Successful Call: {successful_call}")
+    return result
 
-    def should_pick_from_discard(self, discard_pile: List[Card], current_hand: List[Card], game_state: GameState, game: DhumbalGame) -> Tuple[bool, Optional[Card]]:
-        if len(current_hand) >= HAND_SIZE: return False, None
-        env = DhumbalEnv(game, [self], self.player_id)
-        env.set_state(game_state)
-        env.state.phase = 'pick'
-        state = env.encode_state()
-        if self.model_type == 'ppo':
-            action_idx, _ = self.agent.act(state, env)
-        else:  # dqn
-            action_idx = self.agent.act(state, env)
-        action = env.index_to_action(action_idx)
-        print(f"{self.name} pick decision: Action index {action_idx}, Selected {action}")
-        return (True, discard_pile[-1]) if action == 'discard' and discard_pile else (False, None)
+def calculate_cohens_d(group1: List[float], group2: List[float]) -> float:
+    if len(group1) < 2 or len(group2) < 2:
+        return 0.0
+    pooled_std = np.sqrt(((len(group1)-1)*np.var(group1) + (len(group2)-1)*np.var(group2)) / (len(group1)+len(group2)-2))
+    return (np.mean(group1) - np.mean(group2)) / pooled_std if pooled_std != 0 else 0.0
 
-    def should_call_jhyap(self, hand: List[Card], game_state: GameState, game: DhumbalGame) -> bool:
-        env = DhumbalEnv(game, [self], self.player_id)
-        env.set_state(game_state)
-        env.state.phase = 'call'
-        state = env.encode_state()
-        if self.model_type == 'ppo':
-            action_idx, _ = self.agent.act(state, env)
-        else:  # dqn
-            action_idx = self.agent.act(state, env)
-        action = env.index_to_action(action_idx)
-        print(f"{self.name} Jhyap decision: Action index {action_idx}, Call Jhyap: {action}")
-        return action
+def simulate_game(game: DhumbalGame, players: List[LearningBasedAI], max_rounds: int = NUM_ROUNDS, verbose: bool = True, debug: bool = False) -> Dict[str, Any]:
+    env = DhumbalEnv(game)
+    round_results = []
+    for round_idx in tqdm(range(max_rounds), desc="Simulating rounds"):
+        if game.is_game_over():
+            logger.info(f"Game ended early due to bankruptcy after {round_idx} rounds")
+            break
+        try:
+            result = simulate_round(game, players, env, verbose, debug)
+            round_results.append(result)
+            bankrupt_players = [i for i, coins in enumerate(game.player_coins) if coins <= 0]
+            if bankrupt_players and verbose:
+                for player in bankrupt_players:
+                    logger.info(f"Player {player} ({players[player].name}) is bankrupt!")
+        except Exception as e:
+            logger.error(f"Error in round {game.round_number}: {e}")
+            return {"error": f"Simulation failed at round {game.round_number}: {str(e)}"}
+    return analyze_game_results(game, players, round_results, verbose)
 
-def evaluate_agents(ppo_agent: LearningBasedAI, dqn_agent: LearningBasedAI, game: DhumbalGame, opponents: List[RuleBasedAI]):
-    players = [ppo_agent, dqn_agent] + opponents
-    env = DhumbalEnv(game, players, 0)
-    win_rates = {'ppo': [], 'dqn': []}
-    episode_turns = []
-    rewards = {'ppo': [], 'dqn': []}
-    os.makedirs('/content', exist_ok=True)
-    csv_path = '/content/evaluation_results.csv'
-    json_path = '/content/evaluation_logs.json'
-    json_log = []
-
-    try:
-        with open(csv_path, 'w', newline='') as csvfile:
-            writer = csv.writer(csvfile)
-            writer.writerow(['Episode', 'PPO_Win', 'DQN_Win', 'Turns', 'PPO_Reward', 'DQN_Reward'])
-            csvfile.flush()
-
-            for episode in range(EVALUATION_EPISODES):
-                state = env.reset()
-                episode_rewards = {'ppo': 0, 'dqn': 0}
-                turns = 0
-                episode_log = {
-                    'episode': episode + 1,
-                    'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                    'turns': [],
-                    'winner': None,
-                    'hand_values': []
-                }
-                print(f"\nStarting Episode {episode+1}/{EVALUATION_EPISODES}")
-
-                while not env.state.done:
-                    current_player = env.state.current_player
-                    player = players[current_player]
-                    if isinstance(player, LearningBasedAI):
-                        if player.model_type == 'ppo':
-                            action_idx, _ = player.agent.act(state, env)
-                        else:  # dqn
-                            action_idx = player.agent.act(state, env)
-                        action = env.index_to_action(action_idx)
-                    else:  # Rule-based AI
-                        if env.state.phase == 'call':
-                            action = player.should_call_jhyap(env.state.hands[current_player], env.state, game)
-                        elif env.state.phase == 'discard':
-                            action = player.choose_discard(env.state.hands[current_player], env.state, game)
-                        else:  # pick
-                            if len(env.state.hands[current_player]) < HAND_SIZE:
-                                should_pick, _ = player.should_pick_from_discard(env.state.discard_pile, env.state.hands[current_player], env.state, game)
-                                action = 'discard' if should_pick else 'deck'
-                            else:
-                                action = 'deck'
-
-                    next_state, reward, done, log_entry = env.step(action, current_player)
-                    if current_player == 0:  # PPO
-                        episode_rewards['ppo'] += reward
-                    elif current_player == 1:  # DQN
-                        episode_rewards['dqn'] += reward
-                    turns += 1
-                    state = next_state
-                    episode_log['turns'].append(log_entry)
-                    if done:
-                        break
-
-                episode_log['winner'] = env.state.winner
-                episode_log['hand_values'] = [game.calculate_hand_value(h) for h in env.state.hands]
-                json_log.append(episode_log)
-                win_rates['ppo'].append(1 if env.state.winner == 0 else 0)
-                win_rates['dqn'].append(1 if env.state.winner == 1 else 0)
-                episode_turns.append(turns)
-                rewards['ppo'].append(episode_rewards['ppo'])
-                rewards['dqn'].append(episode_rewards['dqn'])
-                writer.writerow([episode + 1, win_rates['ppo'][-1], win_rates['dqn'][-1], turns, episode_rewards['ppo'], episode_rewards['dqn']])
-                csvfile.flush()
-                print(f"Episode {episode+1} ended after {turns} turns, PPO Reward {episode_rewards['ppo']}, DQN Reward {episode_rewards['dqn']}, Winner {env.state.winner}")
-
-                if episode % 100 == 0 or episode == EVALUATION_EPISODES - 1:
-                    with open(json_path, 'w') as f:
-                        json.dump(json_log, f, indent=2)
-                    if os.path.exists(json_path):
-                        file_size = os.path.getsize(json_path)
-                        print(f"JSON log saved to {json_path}, File size: {file_size} bytes")
-
-                if episode % 100 == 0:
-                    print(f"Evaluation Episode {episode+1}/{EVALUATION_EPISODES}, "
-                          f"PPO Win Rate: {np.mean(win_rates['ppo'][-100:]):.3f}, "
-                          f"DQN Win Rate: {np.mean(win_rates['dqn'][-100:]):.3f}, "
-                          f"Avg Turns: {np.mean(episode_turns[-100:]):.1f}")
-
-        if os.path.exists(csv_path):
-            file_size = os.path.getsize(csv_path)
-            print(f"Evaluation results saved to {csv_path}, File size: {file_size} bytes")
-            with open(csv_path, 'r') as f:
-                content = f.read()
-                print(f"CSV content preview: {content[:200]}...")
-        if os.path.exists(json_path):
-            file_size = os.path.getsize(json_path)
-            print(f"Final JSON log saved to {json_path}, File size: {file_size} bytes")
-
-        final_ppo_win_rate = np.mean(win_rates['ppo'])
-        final_dqn_win_rate = np.mean(win_rates['dqn'])
-        print(f"\nEvaluation Complete. PPO Win Rate: {final_ppo_win_rate:.3f}, DQN Win Rate: {final_dqn_win_rate:.3f}")
-        print(f"Average PPO Reward: {np.mean(rewards['ppo']):.1f}, Average DQN Reward: {np.mean(rewards['dqn']):.1f}")
-        print(f"Average Turns per Episode: {np.mean(episode_turns):.1f}")
-        return final_ppo_win_rate, final_dqn_win_rate
-
-    except Exception as e:
-        print(f"Error during evaluation: {e}")
-        with open(json_path, 'w') as f:
-            json.dump(json_log, f, indent=2)
-        raise
+def analyze_game_results(game: DhumbalGame, players: List[LearningBasedAI], round_results: List[RoundResult], verbose: bool = True) -> Dict[str, Any]:
+    if not round_results:
+        return {"error": "No rounds completed"}
+    total_rounds = len(round_results)
+    final_coins = game.player_coins.copy()
+    winner_id = max(range(game.num_players), key=lambda i: final_coins[i])
+    winner_counts = Counter(r.winner for r in round_results)
+    caller_counts = Counter(r.caller for r in round_results)
+    successful_calls = [r for r in round_results if r.successful_call]
+    success_rates = {}
+    avg_decision_times = [np.mean(ai.decision_times) * 1000 if ai.decision_times else 0.0 for ai in players]
+    win_data = [[] for _ in range(game.num_players)]
+    economic_data = [[] for _ in range(game.num_players)]
+    jhyap_data = [[] for _ in range(game.num_players)]
+    risk_data = [[] for _ in range(game.num_players)]
+    jhyap_calls = [[] for _ in range(game.num_players)]
+    for r in round_results:
+        for i in range(game.num_players):
+            win_data[i].append(1 if r.winner == i else 0)
+            economic_data[i].append(r.coin_changes[i])
+            jhyap_data[i].append(1 if r.caller == i else 0)
+            if r.caller == i:
+                jhyap_calls[i].append(r.hand_values[i])
+                risk_data[i].append(1 if r.successful_call else 0)
+    for i in range(game.num_players):
+        calls_made = caller_counts.get(i, 0)
+        successful = len([r for r in successful_calls if r.caller == i])
+        success_rates[i] = (successful / calls_made * 100) if calls_made > 0 else 0
+    avg_winning_hand = sum(min(r.hand_values) for r in round_results) / total_rounds if total_rounds > 0 else 0
+    avg_turns_per_round = sum(r.turns_played for r in round_results) / total_rounds if total_rounds > 0 else 0
+    total_coins_transferred = sum(sum(abs(change) for change in r.coin_changes) for r in round_results) / 2
+    win_rates = [winner_counts.get(i, 0) / total_rounds * 100 for i in range(game.num_players)] if total_rounds > 0 else [0] * game.num_players
+    win_ci = [1.96 * np.std(win_data[i]) / np.sqrt(total_rounds) * 100 for i in range(game.num_players)] if total_rounds > 0 else [0] * game.num_players
+    economic_performance = [sum(economic_data[i]) / total_rounds for i in range(game.num_players)] if total_rounds > 0 else [0] * game.num_players
+    jhyap_success_rates = [success_rates[i] for i in range(game.num_players)]
+    risk_assessment = []
+    for i in range(game.num_players):
+        calls = jhyap_calls[i]
+        successes = risk_data[i]
+        if len(calls) > 1:
+            corr = np.corrcoef(calls, successes)[0, 1]
+            risk_assessment.append(corr)
+        else:
+            risk_assessment.append(None)
+    cohens_d = {}
+    p_values = {}
+    metrics = ['win', 'economic', 'jhyap']
+    data_lists = [win_data, economic_data, jhyap_data]
+    comparisons = [(0, 1)]
+    adjusted_alpha = 0.05 / len(comparisons) if comparisons else 0.05
+    for m, metric in enumerate(metrics):
+        cohens_d[metric] = {}
+        p_values[metric] = {}
+        for pair in comparisons:
+            i, j = pair
+            comp_key = f'P{i} vs P{j}'
+            cohens_d[metric][comp_key] = calculate_cohens_d(data_lists[m][i], data_lists[m][j])
+            if len(data_lists[m][i]) >= 2 and len(data_lists[m][j]) >= 2:
+                _, p_val = ttest_ind(data_lists[m][i], data_lists[m][j], equal_var=False)
+                p_values[metric][comp_key] = p_val
+            else:
+                p_values[metric][comp_key] = None
+    results = {
+        'game_summary': {
+            'total_rounds': total_rounds,
+            'final_winner': winner_id,
+            'winner_name': players[winner_id].name,
+            'final_coins': final_coins,
+            'starting_coins': STARTING_COINS
+        },
+        'player_performance': {
+            'win_rates': win_rates,
+            'win_ci': win_ci,
+            'economic_performance': economic_performance,
+            'jhyap_success_rates': jhyap_success_rates,
+            'risk_assessment': risk_assessment,
+            'avg_decision_times_ms': avg_decision_times
+        },
+        'game_statistics': {
+            'avg_winning_hand_value': round(avg_winning_hand, 1),
+            'avg_turns_per_round': round(avg_turns_per_round, 1),
+            'successful_calls': len(successful_calls),
+            'total_coins_transferred': int(total_coins_transferred)
+        },
+        'statistical_analysis': {
+            'cohens_d': cohens_d,
+            'p_values': p_values,
+            'adjusted_alpha': adjusted_alpha
+        },
+        'round_details': [r.to_dict() for r in round_results]
+    }
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    csv_metrics_path = f'game_metrics_rounds_{total_rounds}_{timestamp}.csv'
+    csv_cohens_path = f'game_cohens_d_rounds_{total_rounds}_{timestamp}.csv'
+    json_path = f'game_results_rounds_{total_rounds}_{timestamp}.json'
+    with open(csv_metrics_path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['Player', 'Win Rate (%)', 'Win CI (%)', 'Economic Perf.', 'Jhyap Success (%)', 'Risk Corr.', 'Avg Dec. Time (ms)'])
+        for i in range(game.num_players):
+            risk_val = risk_assessment[i] if risk_assessment[i] is not None else 'N/A'
+            writer.writerow([
+                players[i].name,
+                f"{win_rates[i]:.1f}",
+                f"{win_ci[i]:.1f}",
+                f"{economic_performance[i]:.1f}",
+                f"{jhyap_success_rates[i]:.1f}",
+                risk_val,
+                f"{avg_decision_times[i]:.1f}"
+            ])
+    with open(csv_cohens_path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        header = ['Comparison']
+        for metric in metrics:
+            header.extend([f'{metric.capitalize()} d', f'{metric.capitalize()} p'])
+        writer.writerow(header)
+        for comp in comparisons:
+            comp_key = f'P{comp[0]} vs P{comp[1]}'
+            row = [comp_key]
+            for metric in metrics:
+                d = cohens_d[metric][comp_key]
+                p = p_values[metric][comp_key] if p_values[metric][comp_key] is not None else 'N/A'
+                row.extend([f"{d:.3f}", f"{p:.4f}" if isinstance(p, float) else p])
+            writer.writerow(row)
+    with open(json_path, 'w') as f:
+        json.dump(results, f, indent=4)
+    if verbose:
+        logger.info(f"\n{'='*60}")
+        logger.info(f"GAME ANALYSIS ({total_rounds} Rounds)")
+        logger.info(f"{'='*60}")
+        logger.info(f"🏆 Winner: {results['game_summary']['winner_name']}")
+        logger.info(f"Total coins transferred: {total_coins_transferred:.0f}")
+        logger.info("\nFinal Standings:")
+        for rank, pid in enumerate(sorted(range(game.num_players), key=lambda i: final_coins[i], reverse=True), 1):
+            change = final_coins[pid] - STARTING_COINS
+            logger.info(f"  {rank}. {players[pid].name}: {final_coins[pid]:,} coins {f'(+{change:,})' if change > 0 else f'({change:,})'}")
+        logger.info("\nPlayer Statistics:")
+        for i in range(game.num_players):
+            logger.info(f"  {players[i].name}:")
+            logger.info(f"    • Win Rate: {win_rates[i]:.1f}% ± {win_ci[i]:.1f}%")
+            logger.info(f"    • Avg. Coins/Round: {economic_performance[i]:.1f}")
+            logger.info(f"    • Jhyap Success: {jhyap_success_rates[i]:.1f}%")
+            risk_val = f"{risk_assessment[i]:.3f}" if risk_assessment[i] is not None else "N/A"
+            logger.info(f"    • Risk Correlation: {risk_val}")
+            logger.info(f"    • Avg. Decision Time: {avg_decision_times[i]:.1f} ms")
+        logger.info("\nGame Statistics:")
+        logger.info(f"  • Avg. Winning Hand: {avg_winning_hand:.1f} points")
+        logger.info(f"  • Avg. Turns/Round: {avg_turns_per_round:.1f}")
+        logger.info(f"  • Successful Calls: {len(successful_calls)} / {total_rounds} ({len(successful_calls)/total_rounds*100:.1f}% if total_rounds > 0 else 0)")
+        logger.info(f"\nFiles saved: {csv_metrics_path}, {csv_cohens_path}, {json_path}")
+    return results
 
 if __name__ == "__main__":
     game = DhumbalGame(num_players=NUM_PLAYERS)
-    state_size = 52 + 52  # Hand + discard pile encoding
-    max_action_size = 5   # Max single-card discards
+    state_size = STATE_SIZE
+    max_action_size = MAX_ACTION_SIZE
     try:
         ppo_player = LearningBasedAI(0, state_size, max_action_size, model_type='ppo')
         dqn_player = LearningBasedAI(1, state_size, max_action_size, model_type='dqn')
-        opponents = [
-            RuleBasedAI(2, AIStyle.CONSERVATIVE),
-            RuleBasedAI(3, AIStyle.AGGRESSIVE),
-            RuleBasedAI(4, AIStyle.OPPORTUNISTIC)
-        ]
-        print("Starting PPO vs DQN Evaluation...")
-        ppo_win_rate, dqn_win_rate = evaluate_agents(ppo_player, dqn_player, game, opponents)
-        print(f"Final Results: PPO Win Rate: {ppo_win_rate:.3f}, DQN Win Rate: {dqn_win_rate:.3f}")
+        players = [ppo_player, dqn_player]
+        logger.info("🃏 DHUMBAL (Jhyap) LEARNING-BASED AI SIMULATION (PPO vs DQN)")
+        logger.info("=" * 70)
+        logger.info(f"Configuration: {NUM_ROUNDS} rounds, {game.num_players} players, seed=42")
+        logger.info(f"State Size: {state_size}, Max Action Size: {max_action_size}")
+        logger.info(f"Starting Coins/Player: {STARTING_COINS:,}")
+        logger.info("\nAI Agents:")
+        for player in players:
+            logger.info(f"  • {player.name} ({player.model_type.upper()})")
+        logger.info("\nStarting simulation...")
+        results = simulate_game(game, players, max_rounds=NUM_ROUNDS, verbose=True, debug=False)
+        logger.info("\n" + "=" * 70)
+        logger.info("✅ SIMULATION COMPLETE")
+        logger.info("=" * 70)
+        if "error" not in results:
+            logger.info(f"Overall Winner: {results['game_summary']['winner_name']}")
+            logger.info(f"Rounds Completed: {results['game_summary']['total_rounds']}")
+            logger.info(f"Avg. Winning Hand Value: {results['game_statistics']['avg_winning_hand_value']:.1f} points")
+        else:
+            logger.error(f"Simulation failed: {results['error']}")
     except FileNotFoundError as e:
-        print(f"Model loading failed: {e}")
+        logger.error(f"Model loading failed: {e}")
+        logger.error("Please ensure the model weight files exist in ./ppo/ and ./dqn/ directories.")
     except Exception as e:
-        print(f"Evaluation failed: {e}")
+        logger.error(f"Evaluation failed: {e}")
