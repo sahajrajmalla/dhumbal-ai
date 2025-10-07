@@ -50,7 +50,7 @@ MAX_PLAYERS = 5
 MIN_PLAYERS = 2
 HAND_SIZE = 5
 JHYAP_THRESHOLD = 10
-STARTING_COINS = 1000000
+STARTING_COINS = 10000
 MAX_TURNS = 100
 MIN_DISCARD_PILE_SIZE = 2
 MAX_PAYMENT = 100
@@ -794,7 +794,7 @@ def analyze_game_results(game: DhumbalGame, ai_players: List[RuleBasedAI], round
 if __name__ == "__main__":
     random.seed(42)
     np.random.seed(42)
-    results = simulate_full_game(num_players=4, max_rounds=2000, verbose=True, debug=False)
+    results = simulate_full_game(num_players=4, max_rounds=1024, verbose=True, debug=False)
     logger.info("\n✅ RULE-BASED TOURNAMENT COMPLETE!")
     logger.info(f"Winner: {results['game_summary']['winner_name']}")
     logger.info(f"Total rounds: {results['game_summary']['total_rounds']}")
