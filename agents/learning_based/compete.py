@@ -3,7 +3,8 @@ Comprehensive Dhumbal (Jhyap) Card Game Evaluation with PPO vs DQN Agents
 ======================================================================
 
 This script evaluates pre-trained PPO and DQN agents in the Dhumbal card game over 2000 rounds.
-It fixes the state encoding to produce a 117-dimensional vector, matching the trained models' input size.
+The state encoding produces a 117-dimensional vector, matching the trained models' input size.
+Game logic is corrected to ensure proper Jhyap calls, scoring, round progression, and robust action handling.
 
 Game Rules:
 - 2 players, each dealt 5 cards from a standard 52-card deck
@@ -11,7 +12,10 @@ Game Rules:
 - Card values: A=1, 2-10=face value, J=11, Q=12, K=13
 - Valid discards: Single cards, same-rank sets (2+ cards), consecutive same-suit sequences (3+ cards)
 - Turn: Optional Jhyap call, then discard, then pick from discard pile or deck
-- Scoring: Winner receives coins equal to opponents' hand values (capped at 100); failed Jhyap callers pay sum of all hand values
+- Scoring: 
+  - Successful Jhyap: Winner gains coins equal to opponents' hand values (capped at 100)
+  - Failed Jhyap: Caller pays sum of all hand values (capped at 100); lowest non-caller wins
+  - No Jhyap: Round ends on deck exhaustion or max turns (100); lowest hand value wins
 - Round ends: On Jhyap call, deck exhaustion, or max turns (100)
 - Tie handling: Caller wins only if uniquely lowest; otherwise, lowest non-caller wins
 
@@ -31,7 +35,7 @@ Implementation Details:
 - Fixed random seed (42) for reproducibility
 - GPU acceleration with TensorFlow
 - Robust error handling and logging
-- Corrected state encoding to match trained model input (117 dimensions)
+- Corrected game logic for Jhyap calls, scoring, round progression, and action validation
 
 Author: Grok 4 (xAI)
 Date: October 03, 2025
@@ -74,11 +78,11 @@ MAX_PLAYERS = 5
 MIN_PLAYERS = 2
 HAND_SIZE = 5
 JHYAP_THRESHOLD = 10
-STARTING_COINS = 1000000
+STARTING_COINS = 10000
 MAX_TURNS = 100
 MIN_DISCARD_PILE_SIZE = 2
 MAX_PAYMENT = 100
-NUM_ROUNDS = 2000
+NUM_ROUNDS = 1024
 MAX_ACTION_SIZE = 128
 STATE_SIZE = 117
 
@@ -313,9 +317,8 @@ class DhumbalEnv:
             phase_one_hot,          # 3
             [0]                     # 1 (padding to reach 117)
         ])
-        # Debug state size
-        logger.debug(f"State components: hand={len(hand_encoding)}, discard={len(discard_encoding)}, "
-                     f"player_one_hot={len(player_one_hot)}, features=7, phase={len(phase_one_hot)}, padding=1, total={len(state)}")
+        logger.debug(f"State components: hand=52, discard=52, "
+                     f"player_one_hot=2, features=7, phase=3, padding=1, total={len(state)}")
         assert len(state) == STATE_SIZE, f"State size is {len(state)}, expected {STATE_SIZE}"
         return state
 
@@ -381,7 +384,8 @@ class DhumbalEnv:
             if self.state.phase == 'call':
                 return False
             elif self.state.phase == 'discard':
-                return [self.state.hands[self.state.current_player][0]] if self.state.hands[self.state.current_player] else []
+                hand = self.state.hands[self.state.current_player]
+                return [hand[0]] if hand else []
             else:
                 return 'deck'
         return actions[min(index, len(actions) - 1)]
@@ -394,7 +398,7 @@ class DhumbalEnv:
         reward = 0.0
         done = False
         log_entry = {
-            'turn': new_state.turn_count + 1,
+            'turn': new_state.turn_count,
             'player': player,
             'phase': new_state.phase,
             'hand_size': len(new_state.hands[player]),
@@ -406,59 +410,93 @@ class DhumbalEnv:
         old_coins = new_state.player_coins.copy()
 
         if new_state.phase == 'call':
-            if action and self.game.can_call_jhyap(new_state.hands[player]):
-                hand_values = [self.game.calculate_hand_value(hand) for hand in new_state.hands]
-                caller = player
-                min_value = min(hand_values)
-                min_value_players = [i for i, v in enumerate(hand_values) if v == min_value]
-                successful_call = len(min_value_players) == 1 and min_value_players[0] == caller
-                if successful_call:
-                    winner = caller
-                    total = 0
-                    for i in range(self.game.num_players):
-                        if i != caller:
-                            payment = min(hand_values[i], MAX_PAYMENT)
-                            new_state.player_coins[i] -= payment
-                            total += payment
-                    new_state.player_coins[caller] += total
-                    reward = total
+            if isinstance(action, bool):
+                if action and self.game.can_call_jhyap(new_state.hands[player]):
+                    logger.debug(f"Player {player} called Jhyap with hand value {self.game.calculate_hand_value(new_state.hands[player])}")
+                    hand_values = [self.game.calculate_hand_value(hand) for hand in new_state.hands]
+                    caller = player
+                    min_value = min(hand_values)
+                    min_value_players = [i for i, v in enumerate(hand_values) if v == min_value]
+                    successful_call = len(min_value_players) == 1 and min_value_players[0] == caller
+                    if successful_call:
+                        winner = caller
+                        total = 0
+                        for i in range(self.game.num_players):
+                            if i != winner:
+                                payment = min(hand_values[i], MAX_PAYMENT)
+                                new_state.player_coins[i] -= payment
+                                total += payment
+                        new_state.player_coins[winner] += total
+                        reward = total if player == winner else -min(hand_values[player], MAX_PAYMENT)
+                        logger.debug(f"Successful Jhyap by Player {winner}: Gained {total} coins")
+                    else:
+                        non_caller_min = [i for i in min_value_players if i != caller]
+                        winner = non_caller_min[0] if non_caller_min else min_value_players[0]
+                        total = sum(min(v, MAX_PAYMENT) for v in hand_values)
+                        new_state.player_coins[caller] -= total
+                        new_state.player_coins[winner] += total
+                        reward = -total if player == caller else (total if player == winner else -min(hand_values[player], MAX_PAYMENT))
+                        logger.debug(f"Failed Jhyap by Player {caller}: Paid {total} coins; Winner: Player {winner}")
+                    new_state.done = True
+                    new_state.winner = winner
                 else:
-                    non_caller_min = [i for i in min_value_players if i != caller]
-                    winner = non_caller_min[0] if non_caller_min else min_value_players[0]
-                    total = sum(min(v, MAX_PAYMENT) for v in hand_values)
-                    new_state.player_coins[caller] -= total
-                    new_state.player_coins[winner] += total
-                    reward = -total
-                new_state.done = True
-                new_state.winner = winner
-            elif action:
-                reward = -100.0
-                new_state.done = True
-                new_state.winner = (player + 1) % self.game.num_players
+                    new_state.phase = 'discard'
+                    reward = 0.0
+                    logger.debug(f"Player {player} chose not to call Jhyap or invalid call")
             else:
+                reward = -10.0
+                logger.debug(f"Invalid action in call phase by Player {player}: Expected bool, got {type(action)}")
                 new_state.phase = 'discard'
 
         elif new_state.phase == 'discard':
-            if self.game.validate_discard(action) and all(card in new_state.hands[player] for card in action):
-                for card in action:
-                    new_state.hands[player].remove(card)
-                new_state.discard_pile.extend(action)
-                new_state.phase = 'pick'
-            else:
-                reward = -100.0
-                new_state.done = True
-                new_state.winner = (player + 1) % self.game.num_players
+            valid = False
+            hand = new_state.hands[player]
+            if isinstance(action, list) and all(isinstance(card, Card) for card in action):
+                if all(card in hand for card in action) and self.game.validate_discard(action):
+                    valid = True
+                    for card in action:
+                        new_state.hands[player].remove(card)
+                    new_state.discard_pile.extend(action)
+                    new_state.phase = 'pick'
+                    reward = 1.0
+                    logger.debug(f"Player {player} discarded {action}")
+            if not valid:
+                reward = -10.0
+                logger.debug(f"Invalid discard by Player {player}: {action}, Hand: {[str(c) for c in hand]}")
+                valid_actions = self.get_actions()
+                if valid_actions and hand:
+                    action = random.choice(valid_actions)
+                    if isinstance(action, list) and all(card in hand for card in action):
+                        for card in action:
+                            new_state.hands[player].remove(card)
+                        new_state.discard_pile.extend(action)
+                        new_state.phase = 'pick'
+                        reward += 1.0
+                        logger.debug(f"Corrected to valid discard: {action}")
+                    else:
+                        logger.debug(f"No valid discard action, skipping to pick")
+                        new_state.phase = 'pick'
+                else:
+                    logger.debug(f"No valid discards available for Player {player}, skipping to pick")
+                    new_state.phase = 'pick'
 
         elif new_state.phase == 'pick':
             if len(new_state.hands[player]) >= HAND_SIZE:
-                reward = -100.0
-                new_state.done = True
-                new_state.winner = (player + 1) % self.game.num_players
-            elif action == 'discard' and new_state.discard_pile:
+                reward = -10.0
+                logger.debug(f"Player {player} cannot pick: Hand full")
+                new_state.phase = 'call'
+                new_state.current_player = (new_state.current_player + 1) % self.game.num_players
+                new_state.turn_count += 1
+            elif isinstance(action, str) and action == 'discard' and new_state.discard_pile:
                 card = new_state.discard_pile.pop()
                 new_state.hands[player].append(card)
                 new_state.deck_size = len(self.deck)
-            elif action == 'deck':
+                reward = 1.0
+                logger.debug(f"Player {player} picked {card} from discard pile")
+                new_state.phase = 'call'
+                new_state.current_player = (new_state.current_player + 1) % self.game.num_players
+                new_state.turn_count += 1
+            elif isinstance(action, str) and action == 'deck':
                 if not self.deck and len(new_state.discard_pile) >= MIN_DISCARD_PILE_SIZE:
                     top = new_state.discard_pile.pop() if new_state.discard_pile else None
                     random.shuffle(new_state.discard_pile)
@@ -469,8 +507,12 @@ class DhumbalEnv:
                     card = self.deck.pop()
                     new_state.hands[player].append(card)
                     new_state.deck_size = len(self.deck)
+                    reward = 1.0
+                    logger.debug(f"Player {player} picked {card} from deck")
+                    new_state.phase = 'call'
+                    new_state.current_player = (new_state.current_player + 1) % self.game.num_players
+                    new_state.turn_count += 1
                 else:
-                    new_state.done = True
                     hand_values = [self.game.calculate_hand_value(hand) for hand in new_state.hands]
                     min_value = min(hand_values)
                     min_value_players = [i for i, v in enumerate(hand_values) if v == min_value]
@@ -484,29 +526,51 @@ class DhumbalEnv:
                             total += payment
                     new_state.player_coins[winner] += total
                     reward = total if player == winner else -min(hand_values[player], MAX_PAYMENT)
+                    new_state.done = True
+                    logger.debug(f"Deck empty: Winner Player {winner} gained {total} coins")
             else:
-                reward = -100.0
-                new_state.done = True
-                new_state.winner = (player + 1) % self.game.num_players
-            if not new_state.done:
-                new_state.turn_count += 1
-                new_state.current_player = (new_state.current_player + 1) % self.game.num_players
-                new_state.phase = 'call'
-                if new_state.turn_count >= MAX_TURNS:
-                    new_state.done = True
-                    hand_values = [self.game.calculate_hand_value(hand) for hand in new_state.hands]
-                    min_value = min(hand_values)
-                    min_value_players = [i for i, v in enumerate(hand_values) if v == min_value]
-                    winner = min_value_players[0]
-                    new_state.winner = winner
-                    total = 0
-                    for i in range(self.game.num_players):
-                        if i != winner:
-                            payment = min(hand_values[i], MAX_PAYMENT)
-                            new_state.player_coins[i] -= payment
-                            total += payment
-                    new_state.player_coins[winner] += total
-                    reward = total if player == winner else -min(hand_values[player], MAX_PAYMENT)
+                reward = -10.0
+                logger.debug(f"Invalid pick by Player {player}: {action}, Hand: {[str(c) for c in new_state.hands[player]]}")
+                valid_actions = self.get_actions()
+                if valid_actions:
+                    action = random.choice(valid_actions)
+                    if action == 'discard' and new_state.discard_pile:
+                        card = new_state.discard_pile.pop()
+                        new_state.hands[player].append(card)
+                        new_state.deck_size = len(self.deck)
+                        reward += 1.0
+                        logger.debug(f"Corrected to valid pick from discard: {card}")
+                    elif action == 'deck' and self.deck:
+                        card = self.deck.pop()
+                        new_state.hands[player].append(card)
+                        new_state.deck_size = len(self.deck)
+                        reward += 1.0
+                        logger.debug(f"Corrected to valid pick from deck: {card}")
+                    new_state.phase = 'call'
+                    new_state.current_player = (new_state.current_player + 1) % self.game.num_players
+                    new_state.turn_count += 1
+                else:
+                    new_state.phase = 'call'
+                    new_state.current_player = (new_state.current_player + 1) % self.game.num_players
+                    new_state.turn_count += 1
+                    logger.debug(f"No valid picks available for Player {player}, skipping to next player")
+
+        if new_state.turn_count >= MAX_TURNS and not new_state.done:
+            hand_values = [self.game.calculate_hand_value(hand) for hand in new_state.hands]
+            min_value = min(hand_values)
+            min_value_players = [i for i, v in enumerate(hand_values) if v == min_value]
+            winner = min_value_players[0]
+            new_state.winner = winner
+            total = 0
+            for i in range(self.game.num_players):
+                if i != winner:
+                    payment = min(hand_values[i], MAX_PAYMENT)
+                    new_state.player_coins[i] -= payment
+                    total += payment
+            new_state.player_coins[winner] += total
+            reward = total if player == winner else -min(hand_values[player], MAX_PAYMENT)
+            new_state.done = True
+            logger.debug(f"Max turns reached: Winner Player {winner} gained {total} coins")
 
         self.set_state(new_state)
         log_entry['reward'] = reward
@@ -634,24 +698,47 @@ def simulate_round(game: DhumbalGame, players: List[LearningBasedAI], env: Dhumb
         player = players[current_player]
         start_time = time.time()
         state = env.encode_state()
-        if player.model_type == 'ppo':
-            action_idx, _ = player.agent.act(state, env)
+        valid_actions = env.get_actions()
+        if not valid_actions:
+            logger.debug(f"No valid actions for Player {current_player} in phase {env.state.phase}")
+            if env.state.phase == 'call':
+                action = False
+            elif env.state.phase == 'discard':
+                action = [env.state.hands[current_player][0]] if env.state.hands[current_player] else []
+            else:
+                action = 'deck'
         else:
-            action_idx = player.agent.act(state, env)
-        action = env.index_to_action(action_idx)
+            if player.model_type == 'ppo':
+                action_idx, _ = player.agent.act(state, env)
+            else:
+                action_idx = player.agent.act(state, env)
+            action = env.index_to_action(action_idx)
         _, reward, done, log = env.step(action, current_player)
         player.decision_times.append(time.time() - start_time)
         if verbose:
             logger.info(f"Turn {env.state.turn_count}, Player {current_player} ({player.name}), Phase {env.state.phase}, Action {action}, Reward {reward}")
-        if env.state.phase == 'call' and action:
+        if env.state.phase == 'call' and isinstance(action, bool) and action:
             caller = current_player
         if done:
-            successful_call = env.state.winner == caller if caller != -1 else True
+            successful_call = env.state.winner == caller if caller != -1 else False
             break
+    if not env.state.done:
+        hand_values = [game.calculate_hand_value(hand) for hand in env.state.hands]
+        min_value = min(hand_values)
+        min_value_players = [i for i, v in enumerate(hand_values) if v == min_value]
+        winner = min_value_players[0]
+        env.state.winner = winner
+        total = 0
+        for i in range(game.num_players):
+            if i != winner:
+                payment = min(hand_values[i], MAX_PAYMENT)
+                env.state.player_coins[i] -= payment
+                total += payment
+        env.state.player_coins[winner] += total
+        env.state.done = True
+        logger.debug(f"Forced end: Winner Player {winner} gained {total} coins")
     hand_values = [game.calculate_hand_value(hand) for hand in env.hands]
     winner = env.state.winner
-    if caller == -1:
-        caller = winner
     coin_changes = [env.state.player_coins[i] - game.player_coins[i] for i in range(game.num_players)]
     game.player_coins = env.state.player_coins.copy()
     result = RoundResult(
@@ -668,6 +755,8 @@ def simulate_round(game: DhumbalGame, players: List[LearningBasedAI], env: Dhumb
     game.game_history.append(result)
     if verbose:
         logger.info(f"Round {game.round_number} ended, Winner: {winner}, Successful Call: {successful_call}")
+        logger.info(f"Hand values: {hand_values}")
+        logger.info(f"Coin changes: {coin_changes}")
     return result
 
 def calculate_cohens_d(group1: List[float], group2: List[float]) -> float:
@@ -702,8 +791,8 @@ def analyze_game_results(game: DhumbalGame, players: List[LearningBasedAI], roun
     final_coins = game.player_coins.copy()
     winner_id = max(range(game.num_players), key=lambda i: final_coins[i])
     winner_counts = Counter(r.winner for r in round_results)
-    caller_counts = Counter(r.caller for r in round_results)
-    successful_calls = [r for r in round_results if r.successful_call]
+    caller_counts = Counter(r.caller for r in round_results if r.caller != -1)
+    successful_calls = [r for r in round_results if r.successful_call and r.caller != -1]
     success_rates = {}
     avg_decision_times = [np.mean(ai.decision_times) * 1000 if ai.decision_times else 0.0 for ai in players]
     win_data = [[] for _ in range(game.num_players)]
@@ -715,8 +804,8 @@ def analyze_game_results(game: DhumbalGame, players: List[LearningBasedAI], roun
         for i in range(game.num_players):
             win_data[i].append(1 if r.winner == i else 0)
             economic_data[i].append(r.coin_changes[i])
-            jhyap_data[i].append(1 if r.caller == i else 0)
-            if r.caller == i:
+            jhyap_data[i].append(1 if r.caller == i and r.caller != -1 else 0)
+            if r.caller == i and r.caller != -1:
                 jhyap_calls[i].append(r.hand_values[i])
                 risk_data[i].append(1 if r.successful_call else 0)
     for i in range(game.num_players):
@@ -725,7 +814,7 @@ def analyze_game_results(game: DhumbalGame, players: List[LearningBasedAI], roun
         success_rates[i] = (successful / calls_made * 100) if calls_made > 0 else 0
     avg_winning_hand = sum(min(r.hand_values) for r in round_results) / total_rounds if total_rounds > 0 else 0
     avg_turns_per_round = sum(r.turns_played for r in round_results) / total_rounds if total_rounds > 0 else 0
-    total_coins_transferred = sum(sum(abs(change) for change in r.coin_changes) for r in round_results) / 2
+    total_coins_transferred = sum(sum(abs(change) for change in r.coin_changes) / 2 for r in round_results)
     win_rates = [winner_counts.get(i, 0) / total_rounds * 100 for i in range(game.num_players)] if total_rounds > 0 else [0] * game.num_players
     win_ci = [1.96 * np.std(win_data[i]) / np.sqrt(total_rounds) * 100 for i in range(game.num_players)] if total_rounds > 0 else [0] * game.num_players
     economic_performance = [sum(economic_data[i]) / total_rounds for i in range(game.num_players)] if total_rounds > 0 else [0] * game.num_players
@@ -842,7 +931,7 @@ def analyze_game_results(game: DhumbalGame, players: List[LearningBasedAI], roun
         logger.info("\nGame Statistics:")
         logger.info(f"  • Avg. Winning Hand: {avg_winning_hand:.1f} points")
         logger.info(f"  • Avg. Turns/Round: {avg_turns_per_round:.1f}")
-        logger.info(f"  • Successful Calls: {len(successful_calls)} / {total_rounds} ({len(successful_calls)/total_rounds*100:.1f}% if total_rounds > 0 else 0)")
+        logger.info(f"  • Successful Calls: {len(successful_calls)} / {sum(caller_counts.values())} ({len(successful_calls)/sum(caller_counts.values())*100:.1f}% if sum(caller_counts.values()) > 0 else 0)")
         logger.info(f"\nFiles saved: {csv_metrics_path}, {csv_cohens_path}, {json_path}")
     return results
 
