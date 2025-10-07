@@ -1,0 +1,7 @@
+Comparison,Win d,Win p,Economic d,Economic p,Jhyap d,Jhyap p
+Aggressive vs ISMCTS,2.606,0.0000,2.073,0.0000,5.022,0.0000
+Aggressive vs PPO,3.576,0.0000,2.759,0.0000,5.321,0.0000
+Aggressive vs Random,3.613,0.0000,2.740,0.0000,5.567,0.0000
+ISMCTS vs PPO,0.343,0.0000,0.682,0.0000,0.050,0.2580
+ISMCTS vs Random,0.355,0.0000,0.639,0.0000,0.092,0.0380
+PPO vs Random,0.017,0.7037,-0.076,0.0878,0.043,0.3330
