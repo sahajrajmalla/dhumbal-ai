@@ -1,0 +1,3 @@
+Player,Win Rate (%),Win CI (%),Economic Perf.,Jhyap Success (%),Cards Disc./Round,Risk Corr.,Avg Dec. Time (ms)
+AI_mcts_0,47.1,3.1,-1.0,97.7,1.0,-0.13682331715544077,2468.7
+AI_ismcts_1,52.9,3.1,1.0,98.2,1.0,-0.09834557066142166,2775.4
