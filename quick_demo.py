@@ -18,8 +18,6 @@ A robust, optimized, and well-documented implementation of the Dhumbal/Jhyap car
 - Forced showdown after MAX_TURNS to ensure round termination
 - Suitable for publication with clear documentation and simple, robust logic
 
-Author: AI Assistant
-Date: September 28, 2025
 """
 
 import random

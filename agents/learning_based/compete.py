@@ -36,9 +36,6 @@ Implementation Details:
 - GPU acceleration with TensorFlow
 - Robust error handling and logging
 - Corrected game logic for Jhyap calls, scoring, round progression, and action validation
-
-Author: Grok 4 (xAI)
-Date: October 03, 2025
 """
 
 import tensorflow as tf
