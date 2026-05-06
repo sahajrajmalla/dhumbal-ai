@@ -1,0 +1,6 @@
+Rule_Ablated,Description,Baseline_WR_%,Baseline_CI_±%,Ablated_WR_%,Ablated_CI_±%,WR_Drop_pp,WR_Drop_%_relative,Cohens_d,p_value,Significant_p<0.05
+No_AggressivePickup,pickup_threshold set to Conservative level (3 instead of 4),35.059,2.923,31.543,2.846,3.516,10.03,0.0746,0.091513,No
+No_MaxDiscard_Pref,discard_high_preference set to neutral (0.8 instead of 1.0),35.059,2.923,34.18,2.905,0.879,2.51,0.0185,0.676115,No
+No_RiskBoost,risk_adjustment set to neutral (1.0 instead of 1.2),35.059,2.923,35.059,2.923,0.0,0.0,0.0,1.0,No
+No_AggressiveJhyap,jhyap_threshold_strict lowered to Conservative level (7 instead of 10) — agent only calls Jhyap when hand ≤ 7,35.059,2.923,35.059,2.923,0.0,0.0,0.0,1.0,No
+No_HighJhyapProb,jhyap_prob_base set to neutral (0.6 instead of 0.8),35.059,2.923,35.059,2.923,0.0,0.0,0.0,1.0,No
