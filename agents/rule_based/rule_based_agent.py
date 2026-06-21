@@ -795,7 +795,7 @@ if __name__ == "__main__":
     random.seed(42)
     np.random.seed(42)
     results = simulate_full_game(num_players=4, max_rounds=1024, verbose=True, debug=False)
-    logger.info("\n✅ RULE-BASED TOURNAMENT COMPLETE!")
+    logger.info("\nRULE-BASED TOURNAMENT COMPLETE!")
     logger.info(f"Winner: {results['game_summary']['winner_name']}")
     logger.info(f"Total rounds: {results['game_summary']['total_rounds']}")
     logger.info(f"Average winning hand: {results['game_statistics']['avg_winning_hand_value']} points")

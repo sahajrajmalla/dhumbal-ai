@@ -541,7 +541,7 @@ def main():
         d        = cohens_d(baseline_flags, abl_flags)
         drop     = base_wr - abl_wr          # positive = rule helps
         pct_drop = (drop / base_wr * 100) if base_wr > 0 else 0
-        sig      = "✓ significant" if p_val < 0.05 else "✗ not significant"
+        sig      = "significant" if p_val < 0.05 else "not significant"
         print(f"      Ablated win rate : {abl_wr:.2f}% ± {abl_ci:.2f}%")
         print(f"      Win-rate drop    : {drop:+.2f} pp  ({pct_drop:+.1f}%)")
         print(f"      Cohen's d        : {d:.4f}")
@@ -600,7 +600,7 @@ def main():
         print(f"{rank:<5} {r['Rule_Ablated']:<28} {r['WR_Drop_pp']:>+.3f} pp   "
               f"{r['Cohens_d']:>+.4f}   {sig}")
     print("-" * 68)
-    print(f"\n✅ Results saved to:\n   {out_csv}\n   {out_json}")
+    print(f"\nResults saved to:\n   {out_csv}\n   {out_json}")
 
 
 if __name__ == "__main__":

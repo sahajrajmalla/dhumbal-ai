@@ -858,7 +858,7 @@ def quick_demo():
 if __name__ == "__main__":
     quick_demo()
     logger.info("\n🎯 Final Robust Dhumbal Implementation Complete!")
-    logger.info("✓ All rules correctly implemented with robust error handling")
-    logger.info("✓ Optimized AI with corrected sequence and discard logic")
-    logger.info("✓ Consistent verbose logging and coin capping")
-    logger.info("✓ Full edge case handling including strict tie rules")
+    logger.info("All rules correctly implemented with robust error handling")
+    logger.info("Optimized AI with corrected sequence and discard logic")
+    logger.info("Consistent verbose logging and coin capping")
+    logger.info("Full edge case handling including strict tie rules")

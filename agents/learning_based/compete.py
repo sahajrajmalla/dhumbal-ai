@@ -1080,7 +1080,7 @@ if __name__ == "__main__":
         logger.info("\nStarting simulation...")
         results = simulate_game(game, players, max_rounds=NUM_ROUNDS, verbose=True, debug=False)
         logger.info("\n" + "=" * 70)
-        logger.info("✅ SIMULATION COMPLETE")
+        logger.info("SIMULATION COMPLETE")
         logger.info("=" * 70)
         if "error" not in results:
             logger.info(f"Selected agent for championship: {results['selected_agent']}")
