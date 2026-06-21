@@ -1,0 +1,32 @@
+{
+  "algorithm": "DQN",
+  "timestamp_start": "2026-06-20 05:40:25",
+  "timestamp_end": "2026-06-20 06:45:31",
+  "wall_clock_seconds": 3906.1,
+  "wall_clock_human": "1h 5m 6s",
+  "episodes_trained": 2400,
+  "training_episodes_budget": 5000,
+  "final_epsilon": 0.01,
+  "early_stopped": true,
+  "stop_reason": "win-rate not significantly rising (slope +0.00000/check <= 1.5*SE 0.00000) and stable (residual std 0.000 <= tol 0.020) with no reward up-trend, over 15 checks (1500 episodes)",
+  "best_rolling_win_rate": 0.0,
+  "best_episode": 1000,
+  "final_rolling_win_rate": 0.0,
+  "final_rolling_mean_reward": 1.63249,
+  "overall_win_rate": 0.0,
+  "overall_mean_turns": 148.59,
+  "artifacts": {
+    "metadata": "dqn_run_metadata.json",
+    "episode_results_csv": "dqn_training_results.csv",
+    "episode_log_json": "dqn_training_log.json",
+    "earlystop_log_csv": "dqn_earlystop_log.csv",
+    "best_weights": [
+      "dqn_model_best.weights.h5",
+      "dqn_target_model_best.weights.h5"
+    ],
+    "final_weights": [
+      "dqn_model_ep_final.weights.h5",
+      "dqn_target_model_ep_final.weights.h5"
+    ]
+  }
+}

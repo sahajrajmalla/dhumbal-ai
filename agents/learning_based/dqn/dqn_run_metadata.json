@@ -1,0 +1,49 @@
+{
+  "algorithm": "DQN",
+  "timestamp_start": "2026-06-20 05:40:25",
+  "seed": 42,
+  "num_players": 4,
+  "training_episodes_budget": 5000,
+  "state_size": 128,
+  "action_size": 128,
+  "opponents_pool": [
+    "conservative",
+    "aggressive",
+    "opportunistic",
+    "balanced"
+  ],
+  "hyperparameters": {
+    "batch_size": 32,
+    "learning_rate": 0.0001,
+    "gamma": 0.99,
+    "epsilon_start": 1.0,
+    "epsilon_end": 0.01,
+    "epsilon_decay": 0.995,
+    "target_update_freq": 100,
+    "replay_memory": 2000
+  },
+  "early_stopping": {
+    "warmup_episodes": 1000,
+    "window": 500,
+    "check_freq": 100,
+    "patience": 15,
+    "min_delta": 0.02,
+    "z": 1.5
+  },
+  "environment": {
+    "starting_coins": 10000,
+    "max_turns": 100,
+    "hand_size": 5,
+    "jhyap_threshold": 10,
+    "max_payment": 100
+  },
+  "runtime": {
+    "python": "3.12.13",
+    "platform": "Linux-6.12.90+-x86_64-with-glibc2.35",
+    "tensorflow": "2.19.0",
+    "numpy": "2.4.6",
+    "gpus": [
+      "Tesla P100-PCIE-16GB"
+    ]
+  }
+}

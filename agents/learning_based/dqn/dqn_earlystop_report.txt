@@ -1,0 +1,11 @@
+
+====================================================================
+EARLY STOPPING TRIGGERED
+====================================================================
+  Reason              : win-rate not significantly rising (slope +0.00000/check <= 1.5*SE 0.00000) and stable (residual std 0.000 <= tol 0.020) with no reward up-trend, over 15 checks (1500 episodes)
+  Episodes trained    : 2400
+  Rolling win-rate    : 0.0000  (best 0.0000 @ ep 1000)
+  Win-rate trend / std: +0.0000 / 0.0000
+  Rolling mean reward : 1.6325  (trend -0.1365)
+  Config              : window=500, check_freq=100, patience=15, warmup=1000, min_delta=0.02, z=1.5
+====================================================================

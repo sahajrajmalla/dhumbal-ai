@@ -23,16 +23,16 @@ np.random.seed(42)
 tf.random.set_seed(42)
 
 # Game constants
-NUM_PLAYERS = 5
+NUM_PLAYERS = 4
 MAX_PLAYERS = 5
 MIN_PLAYERS = 2
 HAND_SIZE = 5
 JHYAP_THRESHOLD = 10
-STARTING_COINS = 1000000
-MAX_TURNS = 50
+STARTING_COINS = 10000
+MAX_TURNS = 100
 MIN_DISCARD_PILE_SIZE = 2
 MAX_PAYMENT = 100
-TRAINING_EPISODES = 50000
+TRAINING_EPISODES = 5000
 BATCH_SIZE = 32
 LEARNING_RATE = 1e-4
 GAMMA = 0.99
@@ -41,8 +41,15 @@ EPSILON_START = 1.0
 EPSILON_END = 0.01
 EPSILON_DECAY = 0.995
 TARGET_UPDATE_FREQ = 100
-CONVERGENCE_THRESHOLD = 0.05  # Reverted to original value
-CONVERGENCE_EPISODES = 500
+# --- Early stopping (statistically grounded; applied to both PPO and DQN) ---
+# Tuned for a ~5000-episode budget on limited (Colab) compute. Parameters live in
+# each training file so PPO and DQN can be tuned independently if needed.
+ES_WARMUP_EPISODES = 1000    # no early stopping before this (covers exploration / epsilon anneal)
+ES_WINDOW = 500              # rolling window for the win-rate and reward signals
+ES_CHECK_FREQ = 100          # evaluate the stop criterion every N episodes
+ES_PATIENCE = 15             # recent checks inspected for a sustained plateau (slope-significance baseline)
+ES_MIN_DELTA = 0.02          # floor on a "meaningful" win-rate change (~1 std-error at p~0.1-0.25)
+ES_Z = 1.5                   # noise multiplier: a trend/volatility must clear z * standard-error to count
 
 class AIStyle(Enum):
     CONSERVATIVE = "conservative"
@@ -322,27 +329,48 @@ class DhumbalEnv:
         for card in hand:
             suit_idx = self.game.SUITS.index(card.suit)
             rank_idx = self.game.RANK_ORDER[card.rank]
-            card_idx = suit_idx * 13 + rank_idx
-            hand_encoding[card_idx] = 1
+            hand_encoding[suit_idx * 13 + rank_idx] = 1
+            
         discard_encoding = np.zeros(52)
         if self.state.discard_pile:
             top_card = self.state.discard_pile[-1]
             suit_idx = self.game.SUITS.index(top_card.suit)
             rank_idx = self.game.RANK_ORDER[top_card.rank]
             discard_encoding[suit_idx * 13 + rank_idx] = 1
+            
         player_one_hot = np.zeros(self.game.num_players)
         player_one_hot[self.state.current_player] = 1
+        
+        hand_sizes_norm = [len(self.state.hands[i]) / HAND_SIZE for i in range(self.game.num_players)]
+        # Coin counts and the cross-round counter are constant *within* a round during
+        # self-play training (coins change only between rounds, which training does not
+        # carry over). They are held constant here so the 128-d encoding is identical in
+        # training and evaluation and the learned policy transfers faithfully.
+        coins_norm = [1.0 for _ in range(self.game.num_players)]
+
         hand_value = self.game.calculate_hand_value(hand) / (13 * HAND_SIZE)
         turn_norm = self.state.turn_count / MAX_TURNS
-        opp_hand_sizes = [len(h) / HAND_SIZE for i, h in enumerate(self.state.hands) if i != self.state.current_player]
-        avg_opp_hand_size = np.mean(opp_hand_sizes) if opp_hand_sizes else 0
-        my_coins_norm = self.state.player_coins[self.state.current_player] / STARTING_COINS
-        avg_opp_coins = np.mean([c / STARTING_COINS for i, c in enumerate(self.state.player_coins) if i != self.state.current_player])
+        discard_pile_size = len(self.state.discard_pile) / 52
+        game_progress = 0.0
+        
         phase_one_hot = np.zeros(3)
         phase_map = {'call': 0, 'discard': 1, 'pick': 2}
-        phase_one_hot[phase_map[self.state.phase]] = 1
-        state = np.concatenate([hand_encoding, discard_encoding, player_one_hot, [hand_value, turn_norm, avg_opp_hand_size, my_coins_norm, avg_opp_coins], phase_one_hot])
-        assert state.shape[0] == 117, f"State size mismatch: expected 117, got {state.shape[0]}"
+        if self.state.phase in phase_map:
+            phase_one_hot[phase_map[self.state.phase]] = 1
+            
+        padding = np.zeros(5)
+        
+        state = np.concatenate([
+            hand_encoding,       # 52
+            discard_encoding,    # 52
+            player_one_hot,      # 4
+            hand_sizes_norm,     # 4
+            coins_norm,          # 4
+            [hand_value, turn_norm, discard_pile_size, game_progress], # 4
+            phase_one_hot,       # 3
+            padding              # 5
+        ])
+        assert state.shape[0] == 128, f"State size mismatch: expected 128, got {state.shape[0]}"
         return state
 
     def get_actions(self) -> List[Any]:
@@ -531,6 +559,12 @@ class DhumbalEnv:
                         reward += -hand_values[player]
 
         self.set_state(new_state)
+        # BUGFIX: return new_state.done. The local `done` was never updated from the
+        # branches that set new_state.done=True, so step() always returned done=False,
+        # i.e. every stored transition looked non-terminal. That broke the DQN target
+        # (terminal bootstrap never zeroed: targets = r + gamma*maxQ*(1-done)), so the
+        # network learned from incorrect terminal targets.
+        done = new_state.done
         log_entry['reward'] = reward
         log_entry['done'] = done
         log_entry['state_after'] = new_state.to_dict()
@@ -649,32 +683,254 @@ def simulate_opponent_turn(env: DhumbalEnv, opponent: RuleBasedAI):
     next_state, _, done, log_entry = env.step(action)
     return next_state, done, log_entry
 
-def train_agent(agent: LearningBasedAI, game: DhumbalGame, opponents: List[RuleBasedAI], batch_size: int):
-    env = DhumbalEnv(game, [agent] + opponents, agent.player_id)
+class EarlyStopping:
+    """Statistically-grounded early stopping for noisy, sparse-reward,
+    non-stationary multi-agent RL.
+
+    The rolling win-rate (the task objective) is the primary signal; the rolling
+    mean episode reward is a secondary signal. On a fixed cadence (`check_freq`),
+    over a rolling `window`, the criterion declares a plateau and stops when, over
+    the most recent `patience` checks, ALL hold:
+
+      1. Win-rate is not significantly rising. An ordinary-least-squares slope is
+         fit to the recent per-check win-rates; the signal counts as "still
+         improving" only if that slope is positive by more than z times its OWN
+         standard error. This detects slow-but-consistent gains (small residual ->
+         small slope SE) while ignoring noisy fluctuation (large residual -> large
+         slope SE), so a sub-noise wiggle is never read as progress.
+      2. Win-rate is stable. The de-trended residual std of the recent per-check
+         win-rates must be <= max(min_delta, z * SE), where SE = sqrt(p(1-p)/window)
+         is the binomial standard error, so a policy oscillating around a flat
+         trend (high residual variance) is NOT mistaken for convergence.
+      3. Reward shows no significant up-trend. Reward defers stopping only when its
+         own OLS slope is positive by > z standard errors; noisy reward gains
+         therefore cannot keep training alive (no wasted compute), while a real
+         reward climb (e.g. learning to reduce hand value before wins materialise)
+         does.
+
+    Cost: one O(window) mean and O(patience) stats, only on check episodes.
+    """
+
+    def __init__(self, warmup_episodes, window, check_freq, patience, min_delta, z):
+        self.warmup_episodes = warmup_episodes
+        self.window = window
+        self.check_freq = check_freq
+        self.patience = patience
+        self.min_delta = min_delta
+        self.z = z
+        self.wins = deque(maxlen=window)
+        self.rewards = deque(maxlen=window)
+        self.win_checks = deque(maxlen=patience)   # rolling win-rate at each check
+        self.rew_checks = deque(maxlen=patience)   # rolling mean reward at each check
+        self.best_win_rate = -np.inf
+        self.best_episode = 0
+        self.win_rate = 0.0
+        self.mean_reward = 0.0
+        self.win_trend = 0.0
+        self.win_vol = 0.0
+        self.rew_trend = 0.0
+        self.stop_reason = None
+
+    def update(self, episode, win, reward):
+        """Record one episode; return (should_stop, is_new_best).
+
+        `is_new_best` flags a new best rolling win-rate so the caller can
+        checkpoint the best policy independently of the stop decision.
+        """
+        self.wins.append(win)
+        self.rewards.append(reward)
+
+        # Only test on the cadence, after warm-up, once the window is full.
+        if (episode < self.warmup_episodes
+                or len(self.wins) < self.window
+                or episode % self.check_freq != 0):
+            return False, False
+
+        self.win_rate = float(np.mean(self.wins))
+        self.mean_reward = float(np.mean(self.rewards))
+        self.win_checks.append(self.win_rate)
+        self.rew_checks.append(self.mean_reward)
+
+        is_new_best = self.win_rate > self.best_win_rate
+        if is_new_best:
+            self.best_win_rate = self.win_rate
+            self.best_episode = episode
+
+        # Need a full patience-history of checks before judging a sustained plateau.
+        if len(self.win_checks) < self.patience:
+            return False, is_new_best
+
+        n = self.patience
+        x = np.arange(n, dtype=np.float64)
+        sxx = float(np.sum((x - x.mean()) ** 2))         # for the OLS slope standard error
+        wc = np.array(self.win_checks, dtype=np.float64)
+        rc = np.array(self.rew_checks, dtype=np.float64)
+        se_p = np.sqrt(max(self.win_rate * (1.0 - self.win_rate), 1e-6) / self.window)
+        tol = max(self.min_delta, self.z * se_p)
+
+        # Fit an OLS slope to each signal over the recent checks and compare it to its OWN
+        # standard error. A signal counts as "still rising" only if its slope is positive
+        # by more than z standard errors (a statistically significant up-trend). This
+        # detects slow-but-consistent improvement (small residual -> small slope SE) yet
+        # ignores noisy fluctuation (large residual -> large slope SE).
+        sw, iw = np.polyfit(x, wc, 1)
+        w_resid = wc - (sw * x + iw)
+        self.win_vol = float(np.std(w_resid))                  # oscillation around the trend
+        self.win_trend = float(sw * (n - 1))                   # projected change across window (for logs)
+        se_slope_w = float(np.sqrt(np.sum(w_resid ** 2) / max(n - 2, 1)) / np.sqrt(sxx)) + 1e-12
+        sr, ir = np.polyfit(x, rc, 1)
+        r_resid = rc - (sr * x + ir)
+        self.rew_trend = float(sr * (n - 1))
+        se_slope_r = float(np.sqrt(np.sum(r_resid ** 2) / max(n - 2, 1)) / np.sqrt(sxx)) + 1e-12
+
+        win_rising = sw > self.z * se_slope_w                  # statistically significant win-rate up-trend
+        win_stable = self.win_vol <= tol                       # low oscillation around the trend
+        reward_rising = sr > self.z * se_slope_r               # statistically significant reward up-trend
+
+        if (not win_rising) and win_stable and (not reward_rising):
+            self.stop_reason = (
+                f"win-rate not significantly rising (slope {sw:+.5f}/check <= "
+                f"{self.z}*SE {self.z * se_slope_w:.5f}) and stable (residual std "
+                f"{self.win_vol:.3f} <= tol {tol:.3f}) with no reward up-trend, over "
+                f"{self.patience} checks ({self.patience * self.check_freq} episodes)"
+            )
+            return True, is_new_best
+        return False, is_new_best
+
+    def report(self, episode):
+        return (
+            "\n" + "=" * 68 + "\n"
+            + "EARLY STOPPING TRIGGERED\n"
+            + "=" * 68 + "\n"
+            + f"  Reason              : {self.stop_reason}\n"
+            + f"  Episodes trained    : {episode}\n"
+            + f"  Rolling win-rate    : {self.win_rate:.4f}  (best {self.best_win_rate:.4f} @ ep {self.best_episode})\n"
+            + f"  Win-rate trend / std: {self.win_trend:+.4f} / {self.win_vol:.4f}\n"
+            + f"  Rolling mean reward : {self.mean_reward:.4f}  (trend {self.rew_trend:+.4f})\n"
+            + f"  Config              : window={self.window}, check_freq={self.check_freq}, "
+            + f"patience={self.patience}, warmup={self.warmup_episodes}, min_delta={self.min_delta}, z={self.z}\n"
+            + "=" * 68
+        )
+
+
+def _runtime_info():
+    """Best-effort software/hardware fingerprint for reproducibility (never raises)."""
+    info = {}
+    try:
+        import platform as _pf
+        info['python'] = _pf.python_version()
+        info['platform'] = _pf.platform()
+    except Exception:
+        pass
+    try:
+        info['tensorflow'] = tf.__version__
+    except Exception:
+        pass
+    try:
+        info['numpy'] = np.__version__
+    except Exception:
+        pass
+    try:
+        gpus = tf.config.list_physical_devices('GPU')
+        names = []
+        for g in gpus:
+            try:
+                names.append(tf.config.experimental.get_device_details(g).get('device_name', g.name))
+            except Exception:
+                names.append(g.name)
+        info['gpus'] = names if names else 'CPU-only'
+    except Exception:
+        pass
+    return info
+
+
+def _write_es_log(path, rows):
+    """Write the per-check early-stopping diagnostics to CSV (no-op if empty)."""
+    if not rows:
+        return
+    with open(path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def train_agent(agent: LearningBasedAI, game: DhumbalGame, opponents_pool: List['RuleBasedAI'], batch_size: int):
     win_rates = []
     episode_turns = []
     best_win_rate = 0
     best_model = None
-    csv_path = 'dqn_training_results.csv'
-    json_path = 'dqn_training_log.json'
+    stopper = EarlyStopping(
+        warmup_episodes=ES_WARMUP_EPISODES,
+        window=ES_WINDOW,
+        check_freq=ES_CHECK_FREQ,
+        patience=ES_PATIENCE,
+        min_delta=ES_MIN_DELTA,
+        z=ES_Z,
+    )
+    base_dir = os.path.dirname(__file__)
+    csv_path = os.path.join(base_dir, 'dqn_training_results.csv')
+    json_path = os.path.join(base_dir, 'dqn_training_log.json')
+    meta_path = os.path.join(base_dir, 'dqn_run_metadata.json')
+    summary_path = os.path.join(base_dir, 'dqn_training_summary.json')
+    es_log_path = os.path.join(base_dir, 'dqn_earlystop_log.csv')
     json_log = []
+    es_history = []
+    run_start = datetime.now()
+
+    # --- Reproducibility metadata: full config written once, before training starts ---
+    metadata = {
+        'algorithm': 'DQN',
+        'timestamp_start': run_start.strftime('%Y-%m-%d %H:%M:%S'),
+        'seed': 42,
+        'num_players': game.num_players,
+        'training_episodes_budget': TRAINING_EPISODES,
+        'state_size': getattr(agent, 'state_size', None),
+        'action_size': getattr(agent, 'max_action_size', None),
+        'opponents_pool': [o.style.value for o in opponents_pool],
+        'hyperparameters': {
+            'batch_size': BATCH_SIZE, 'learning_rate': LEARNING_RATE, 'gamma': GAMMA,
+            'epsilon_start': EPSILON_START, 'epsilon_end': EPSILON_END,
+            'epsilon_decay': EPSILON_DECAY, 'target_update_freq': TARGET_UPDATE_FREQ,
+            'replay_memory': MAX_MEMORY,
+        },
+        'early_stopping': {
+            'warmup_episodes': ES_WARMUP_EPISODES, 'window': ES_WINDOW,
+            'check_freq': ES_CHECK_FREQ, 'patience': ES_PATIENCE,
+            'min_delta': ES_MIN_DELTA, 'z': ES_Z,
+        },
+        'environment': {
+            'starting_coins': STARTING_COINS, 'max_turns': MAX_TURNS, 'hand_size': HAND_SIZE,
+            'jhyap_threshold': JHYAP_THRESHOLD, 'max_payment': MAX_PAYMENT,
+        },
+        'runtime': _runtime_info(),
+    }
+    with open(meta_path, 'w') as f:
+        json.dump(metadata, f, indent=2)
+    print(f"Run metadata written to {os.path.basename(meta_path)}")
 
     with open(csv_path, 'w', newline='') as csvfile:
         writer = csv.writer(csvfile)
-        writer.writerow(['Episode', 'Win', 'Turns', 'Reward'])
+        writer.writerow(['Episode', 'Win', 'Turns', 'Reward', 'Seat'])
         csvfile.flush()
         for episode in range(TRAINING_EPISODES):
+            # Dynamic Seating and Opponent Randomization
+            selected_opponents = random.sample(opponents_pool, game.num_players - 1)
+            players = [agent] + selected_opponents
+            random.shuffle(players)
+            
+            # Reassign player IDs based on randomized seating
+            for idx, p in enumerate(players):
+                p.player_id = idx
+            
+            # Initialize environment. The round always starts at seat 0; because the
+            # agent occupies a randomized seat each episode (assigned above), it
+            # experiences every turn position over training. This matches evaluation
+            # (compete.py / championship), where the agent is usually not first to act.
+            env = DhumbalEnv(game, players, 0)
+            
             state = env.reset()
             episode_reward = 0
             turns = 0
-            episode_log = {
-                'episode': episode + 1,
-                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                'turns': [],
-                'total_reward': 0,
-                'winner': None,
-                'epsilon': agent.agent.epsilon
-            }
             while not env.state.done:
                 if env.state.current_player == agent.player_id:
                     action_idx = agent.agent.act(state, env)
@@ -683,63 +939,136 @@ def train_agent(agent: LearningBasedAI, game: DhumbalGame, opponents: List[RuleB
                     agent.agent.remember(state, action_idx, reward, next_state, done)
                     episode_reward += reward
                     state = next_state
+                    agent.agent.replay(batch_size)
+                    agent.agent.step_count += 1
+                    if agent.agent.step_count % TARGET_UPDATE_FREQ == 0:
+                        agent.agent.update_target_model()
                 else:
-                    opponent_idx = env.state.current_player - 1 if env.state.current_player > agent.player_id else env.state.current_player
-                    opponent = opponents[opponent_idx]
-                    next_state, done, log_entry = simulate_opponent_turn(env, opponent)
-                episode_log['turns'].append(log_entry)
+                    opponent = players[env.state.current_player]
+                    state, done, _ = simulate_opponent_turn(env, opponent)
                 turns += 1
                 if done:
                     break
-            agent.agent.replay(batch_size)
-            if (agent.agent.step_count + 1) % TARGET_UPDATE_FREQ == 0:
-                agent.agent.update_target_model()
-            agent.agent.step_count += 1
-
-            episode_log['total_reward'] = episode_reward
-            episode_log['winner'] = env.state.winner
-            episode_log['epsilon'] = agent.agent.epsilon
-            json_log.append(episode_log)
 
             win = 1 if env.state.winner == agent.player_id else 0
-            writer.writerow([episode + 1, win, turns, episode_reward])
+            writer.writerow([episode + 1, win, turns, episode_reward, agent.player_id])
             csvfile.flush()
             win_rates.append(win)
             episode_turns.append(turns)
+            # Lightweight, bounded-memory episode log (no per-turn state dumps): avoids the
+            # old O(n^2) full-log rewrite and the unbounded RAM growth of per-turn logging.
+            json_log.append({
+                'episode': episode + 1,
+                'win': win,
+                'turns': turns,
+                'reward': round(episode_reward, 4),
+                'winner': env.state.winner,
+                'agent_seat': agent.player_id,
+                'epsilon': round(float(agent.agent.epsilon), 4),
+            })
 
-            print(f"Episode {episode + 1}/{TRAINING_EPISODES}: Win={win}, Turns={turns}, Reward={episode_reward:.2f}, Epsilon={agent.agent.epsilon:.4f}")
+            print(f"Episode {episode + 1}/{TRAINING_EPISODES} (Seat {agent.player_id}): Win={win}, Turns={turns}, Reward={episode_reward:.2f}, Epsilon={agent.agent.epsilon:.3f}")
 
-            if len(win_rates) >= CONVERGENCE_EPISODES:
-                recent_win_rate = np.mean(win_rates[-CONVERGENCE_EPISODES:])
-                if len(win_rates) >= 2 * CONVERGENCE_EPISODES and abs(recent_win_rate - np.mean(win_rates[-2*CONVERGENCE_EPISODES:-CONVERGENCE_EPISODES])) < CONVERGENCE_THRESHOLD:
-                    break
-                if recent_win_rate > best_win_rate:
-                    best_win_rate = recent_win_rate
-                    best_model = agent.agent.model.get_weights()
-                    agent.agent.model.save_weights(f'dqn_model_ep{episode+1}.weights.h5')
-                    agent.agent.target_model.save_weights(f'dqn_target_model_ep{episode+1}.weights.h5')
+            # Early stopping on the rolling win-rate (primary) + reward (secondary) signals.
+            should_stop, is_new_best = stopper.update(episode + 1, win, episode_reward)
+            if is_new_best:
+                best_win_rate = stopper.best_win_rate
+                best_model = (agent.agent.model.get_weights(), agent.agent.target_model.get_weights())
+                agent.agent.model.save_weights(os.path.join(base_dir, 'dqn_model_best.weights.h5'))
+                agent.agent.target_model.save_weights(os.path.join(base_dir, 'dqn_target_model_best.weights.h5'))
 
-            with open(json_path, 'w') as f:
-                json.dump(json_log, f, indent=2)
-            
-            agent.agent.model.save_weights(f'dqn_model_ep_last.weights.h5')
-            agent.agent.target_model.save_weights(f'dqn_target_ model_ep_last.weights.h5')
+            # Record early-stopping diagnostics on every check episode: a reproducible
+            # trace of how/when the win-rate converged and where training was halted.
+            if (episode + 1) >= ES_WARMUP_EPISODES and (episode + 1) % ES_CHECK_FREQ == 0:
+                es_history.append({
+                    'episode': episode + 1,
+                    'rolling_win_rate': round(stopper.win_rate, 5),
+                    'rolling_mean_reward': round(stopper.mean_reward, 5),
+                    'win_trend': round(stopper.win_trend, 5),
+                    'win_residual_std': round(stopper.win_vol, 5),
+                    'reward_trend': round(stopper.rew_trend, 5),
+                    'best_win_rate': round(stopper.best_win_rate, 5),
+                    'epsilon': round(float(agent.agent.epsilon), 5),
+                    'is_new_best': int(is_new_best),
+                    'stopped': int(should_stop),
+                })
 
+            # Periodic (not per-episode) disk writes so the GPU is not stalled on I/O.
+            # The CSV above is the per-episode live record; this is a coarse snapshot.
+            if (episode + 1) % ES_CHECK_FREQ == 0 or should_stop or (episode + 1) == TRAINING_EPISODES:
+                with open(json_path, 'w') as f:
+                    json.dump(json_log, f, indent=2)
+                _write_es_log(es_log_path, es_history)
+                agent.agent.model.save_weights(os.path.join(base_dir, 'dqn_model_ep_last.weights.h5'))
+                agent.agent.target_model.save_weights(os.path.join(base_dir, 'dqn_target_model_ep_last.weights.h5'))
+
+            if should_stop:
+                print(stopper.report(episode + 1))
+                break
 
     if best_model:
-        agent.agent.model.set_weights(best_model)
+        agent.agent.model.set_weights(best_model[0])
+        agent.agent.target_model.set_weights(best_model[1])
+        agent.agent.model.save_weights(os.path.join(base_dir, 'dqn_model_ep_final.weights.h5'))
+        agent.agent.target_model.save_weights(os.path.join(base_dir, 'dqn_target_model_ep_final.weights.h5'))
+        print("Final DQN models saved.")
+    else:
+        # Fallback if no best model
+        agent.agent.model.save_weights(os.path.join(base_dir, 'dqn_model_ep_final.weights.h5'))
+        agent.agent.target_model.save_weights(os.path.join(base_dir, 'dqn_target_model_ep_final.weights.h5'))
+        print("Final DQN models saved.")
+
+    # --- Training summary: quotable final results + run provenance for the paper ---
+    duration = (datetime.now() - run_start).total_seconds()
+    episodes_trained = episode + 1
+    _write_es_log(es_log_path, es_history)
+    summary = {
+        'algorithm': 'DQN',
+        'timestamp_start': run_start.strftime('%Y-%m-%d %H:%M:%S'),
+        'timestamp_end': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'wall_clock_seconds': round(duration, 1),
+        'wall_clock_human': f"{int(duration // 3600)}h {int((duration % 3600) // 60)}m {int(duration % 60)}s",
+        'episodes_trained': episodes_trained,
+        'training_episodes_budget': TRAINING_EPISODES,
+        'final_epsilon': round(float(agent.agent.epsilon), 5),
+        'early_stopped': stopper.stop_reason is not None,
+        'stop_reason': stopper.stop_reason,
+        'best_rolling_win_rate': (round(stopper.best_win_rate, 5)
+                                  if stopper.best_win_rate != float('-inf') else None),
+        'best_episode': stopper.best_episode,
+        'final_rolling_win_rate': round(stopper.win_rate, 5),
+        'final_rolling_mean_reward': round(stopper.mean_reward, 5),
+        'overall_win_rate': round(float(np.mean(win_rates)), 5) if win_rates else None,
+        'overall_mean_turns': round(float(np.mean(episode_turns)), 2) if episode_turns else None,
+        'artifacts': {
+            'metadata': os.path.basename(meta_path),
+            'episode_results_csv': os.path.basename(csv_path),
+            'episode_log_json': os.path.basename(json_path),
+            'earlystop_log_csv': os.path.basename(es_log_path),
+            'best_weights': ['dqn_model_best.weights.h5', 'dqn_target_model_best.weights.h5'],
+            'final_weights': ['dqn_model_ep_final.weights.h5', 'dqn_target_model_ep_final.weights.h5'],
+        },
+    }
+    with open(summary_path, 'w') as f:
+        json.dump(summary, f, indent=2)
+    if stopper.stop_reason:
+        with open(os.path.join(base_dir, 'dqn_earlystop_report.txt'), 'w') as f:
+            f.write(stopper.report(episodes_trained))
+    print(f"Training summary written to {os.path.basename(summary_path)} "
+          f"({episodes_trained} episodes trained, wall-clock {summary['wall_clock_human']})")
     return best_win_rate
 
 if __name__ == "__main__":
-    game = DhumbalGame(num_players=NUM_PLAYERS)
-    state_size = 52 + 52 + 5 + 5 + 3  # Hand + discard + player_one_hot + features + phase = 117
-    max_action_size = 128
+    game = DhumbalGame(num_players=4)
+    state_size = 128
+    max_action_size = 128  # Supports all possible actions
     dqn_player = LearningBasedAI(0, state_size, max_action_size, model_type='dqn')
-    opponents = [
+    opponents_pool = [
         RuleBasedAI(1, AIStyle.CONSERVATIVE),
         RuleBasedAI(2, AIStyle.AGGRESSIVE),
         RuleBasedAI(3, AIStyle.OPPORTUNISTIC),
         RuleBasedAI(4, AIStyle.BALANCED)
     ]
-    win_rate = train_agent(dqn_player, game, opponents, BATCH_SIZE)
+    print("Training DQN Agent...")
+    win_rate = train_agent(dqn_player, game, opponents_pool, BATCH_SIZE)
     print(f"DQN Training Complete. Best Win Rate: {win_rate:.3f}")

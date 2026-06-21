@@ -1,0 +1,31 @@
+{
+  "algorithm": "PPO",
+  "timestamp_start": "2026-06-20 04:34:26",
+  "timestamp_end": "2026-06-20 06:23:31",
+  "wall_clock_seconds": 6545.0,
+  "wall_clock_human": "1h 49m 5s",
+  "episodes_trained": 2900,
+  "training_episodes_budget": 5000,
+  "early_stopped": true,
+  "stop_reason": "win-rate not significantly rising (slope +0.00184/check <= 1.5*SE 0.00267) and stable (residual std 0.028 <= tol 0.031) with no reward up-trend, over 15 checks (1500 episodes)",
+  "best_rolling_win_rate": 0.382,
+  "best_episode": 2400,
+  "final_rolling_win_rate": 0.304,
+  "final_rolling_mean_reward": 13.10975,
+  "overall_win_rate": 0.31724,
+  "overall_mean_turns": 174.05,
+  "artifacts": {
+    "metadata": "ppo_run_metadata.json",
+    "episode_results_csv": "ppo_training_results.csv",
+    "episode_log_json": "ppo_training_log.json",
+    "earlystop_log_csv": "ppo_earlystop_log.csv",
+    "best_weights": [
+      "ppo_actor_best.weights.h5",
+      "ppo_critic_best.weights.h5"
+    ],
+    "final_weights": [
+      "ppo_actor_final.weights.h5",
+      "ppo_critic_final.weights.h5"
+    ]
+  }
+}

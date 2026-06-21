@@ -4,6 +4,7 @@ import random
 import itertools
 import time
 import json
+import os
 from collections import defaultdict, Counter, OrderedDict
 from dataclasses import dataclass
 from enum import Enum
@@ -28,7 +29,7 @@ EXPLORATION_CONSTANT = math.sqrt(2)
 MAX_DECISION_TIME = 1.5
 ACTION_CACHE_SIZE = 1000
 MAX_ACTION_SIZE = 128
-STATE_SIZE = 117
+STATE_SIZE = 128
 
 class AIStyle(Enum):
     AGGRESSIVE = "aggressive"
@@ -707,7 +708,10 @@ class SearchDhumbalEnv:
                 return new_state, reward, True
 
         self.set_state(new_state)
-        return new_state, reward, done
+        # Return the actual terminal flag (new_state.done). The local `done` was never
+        # updated in the branches that set new_state.done=True; harmless here because the
+        # search code checks sim_env.state.done, but returning the real value is correct.
+        return new_state, reward, new_state.done
 
     def _determinize_hands(self, state):
         det_hands = [state.hands[state.current_player][:] if i == state.current_player else [] for i in range(self.game.num_players)]
@@ -1112,32 +1116,71 @@ class LearningDhumbalEnv:
         return list(self.action_map.values())
 
     def encode_state(self):
-        state = np.zeros(STATE_SIZE, dtype=np.float32)
         hand = self.state.hands[self.state.current_player]
+        hand_encoding = np.zeros(52)
         for card in hand:
             suit_idx = self.game.SUITS.index(card.suit)
             rank_idx = self.game.RANKS.index(card.rank)
-            state[suit_idx * 13 + rank_idx] = 1
+            hand_encoding[suit_idx * 13 + rank_idx] = 1
+            
+        discard_encoding = np.zeros(52)
         if self.state.discard_pile:
             top_card = self.state.discard_pile[-1]
             suit_idx = self.game.SUITS.index(top_card.suit)
             rank_idx = self.game.RANKS.index(top_card.rank)
-            state[52 + suit_idx * 13 + rank_idx] = 1
-        state[104] = self.state.deck_size / 52
-        state[105] = self.state.turn_count / MAX_TURNS
-        state[106] = self.state.player_coins[self.state.current_player] / STARTING_COINS
-        for i, coins in enumerate(self.state.player_coins):
-            state[107 + i] = coins / STARTING_COINS
-        phase_idx = {'jhyap_check': 0, 'discard': 1, 'pick': 2}
-        state[110 + phase_idx[self.state.phase]] = 1
-        state[113] = sum(card.value for card in hand) / 65
-        state[114] = len(hand) / HAND_SIZE
-        state[115] = len(self.state.discard_pile) / 52
-        state[116] = self.state.round_number / NUM_ROUNDS
+            discard_encoding[suit_idx * 13 + rank_idx] = 1
+            
+        player_one_hot = np.zeros(self.game.num_players)
+        player_one_hot[self.state.current_player] = 1
+        
+        hand_sizes_norm = [len(self.state.hands[i]) / HAND_SIZE for i in range(self.game.num_players)]
+        # Held constant to match the training-time encoding (see ppo.py): coins and the
+        # cross-round counter are invariant within a round, so feeding their varying
+        # championship-time values would push the PPO policy out of distribution.
+        coins_norm = [1.0 for _ in range(self.game.num_players)]
+
+        hand_value = sum(card.value for card in hand) / (13 * HAND_SIZE)
+        turn_norm = self.state.turn_count / MAX_TURNS
+        discard_pile_size = len(self.state.discard_pile) / 52
+        game_progress = 0.0
+        
+        phase_one_hot = np.zeros(3)
+        phase_map = {'jhyap_check': 0, 'discard': 1, 'pick': 2}
+        if self.state.phase in phase_map:
+            phase_one_hot[phase_map[self.state.phase]] = 1
+            
+        padding = np.zeros(5)
+        
+        state = np.concatenate([
+            hand_encoding,       # 52
+            discard_encoding,    # 52
+            player_one_hot,      # 4
+            hand_sizes_norm,     # 4
+            coins_norm,          # 4
+            [hand_value, turn_norm, discard_pile_size, game_progress], # 4
+            phase_one_hot,       # 3
+            padding              # 5
+        ])
         return state
 
     def index_to_action(self, index):
-        return self.action_map.get(index, None)
+        # Mirror the training-time decoding (ppo.py index_to_action): sort the legal
+        # actions by key and map the raw network index modulo their count. The raw
+        # action_map is built in insertion order, which does NOT match the sorted order
+        # used during training (e.g. for the call phase it would invert True/False), so
+        # the PPO policy must be decoded through the same sorted+modulo mapping here.
+        actions = list(self.action_map.values())
+        if not actions:
+            return None
+        def action_key(act):
+            if isinstance(act, bool):
+                return str(act)
+            elif isinstance(act, str):
+                return act
+            else:
+                return tuple(sorted(str(c) for c in act))
+        sorted_actions = sorted(actions, key=action_key)
+        return sorted_actions[index % len(sorted_actions)]
 
 class PPO:
     def __init__(self, state_size, max_action_size):
@@ -1161,7 +1204,10 @@ class PPO:
         return models.Model(inputs, outputs)
 
     def act(self, state, env):
-        action_space_size = len(env.get_actions())
+        # Sample a raw index over the full action head (128), exactly as in training
+        # (ppo.py PPO.act). index_to_action() folds it back onto the legal actions via
+        # sorting + modulo, so the policy is decoded identically to training.
+        action_space_size = self.max_action_size
         state = np.array(state).reshape(1, -1)
         probs = self.actor(state)[0].numpy()
         probs = probs[:action_space_size]
@@ -1176,10 +1222,14 @@ class LearningBasedAI(BaseAI):
         self.model_type = model_type
         self.agent = PPO(state_size, max_action_size)
         try:
-            self.agent.actor.load_weights('ppo_actor_final.weights.h5')
-            self.agent.critic.load_weights('ppo_critic_final.weights.h5')
-        except:
-            print(f"Warning: Could not load PPO weights for {self.name}. Using untrained model.")
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            ppo_dir = os.path.join(os.path.dirname(base_dir), 'agents', 'learning_based', 'ppo')
+            actor_path = os.path.join(ppo_dir, 'ppo_actor_final.weights.h5')
+            critic_path = os.path.join(ppo_dir, 'ppo_critic_final.weights.h5')
+            self.agent.actor.load_weights(actor_path)
+            self.agent.critic.load_weights(critic_path)
+        except Exception as e:
+            print(f"Warning: Could not load PPO weights for {self.name} from {actor_path}. Error: {e}. Using untrained model.")
 
     def should_call_jhyap(self, hand, game_state, game):
         start_time = time.perf_counter()
@@ -1235,7 +1285,10 @@ def simulate_round(game, ai_players, cards_discarded):
         turn_count=0,
         phase='jhyap_check'
     )
-    current_player = 0
+    # Rotate the starting player each round so no agent has a permanent first-mover
+    # (first-to-call-Jhyap) advantage. Over the tournament each seat leads equally
+    # often; agents keep stable ids, so per-agent results stay correctly indexed.
+    current_player = game.round_number % game.num_players
     while game_state.turn_count < MAX_TURNS:
         ai = ai_players[current_player]
         player_hand = hands[current_player]
